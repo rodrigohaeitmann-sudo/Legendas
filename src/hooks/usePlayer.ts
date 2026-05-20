@@ -8,20 +8,27 @@ const REPEAT_THRESHOLD = 1
 export function usePlayer(cues: MergedCue[], videoId?: string) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const [currentTime, setCurrentTime] = useState(0)
+  const [duration, setDuration] = useState(0)
   const [isPlaying, setIsPlaying] = useState(false)
 
   useEffect(() => {
     const video = videoRef.current
     if (!video) return
     const onTime = () => setCurrentTime(video.currentTime)
+    const onDuration = () => setDuration(Number.isFinite(video.duration) ? video.duration : 0)
     const onPlay = () => setIsPlaying(true)
     const onPause = () => setIsPlaying(false)
     video.addEventListener('timeupdate', onTime)
+    video.addEventListener('loadedmetadata', onDuration)
+    video.addEventListener('durationchange', onDuration)
     video.addEventListener('play', onPlay)
     video.addEventListener('pause', onPause)
     setIsPlaying(!video.paused)
+    onDuration()
     return () => {
       video.removeEventListener('timeupdate', onTime)
+      video.removeEventListener('loadedmetadata', onDuration)
+      video.removeEventListener('durationchange', onDuration)
       video.removeEventListener('play', onPlay)
       video.removeEventListener('pause', onPause)
     }
@@ -111,5 +118,5 @@ export function usePlayer(cues: MergedCue[], videoId?: string) {
     seekTo(target ? target.start : current.start)
   }, [activeIndex, cues, currentTime, seekTo])
 
-  return { videoRef, currentTime, isPlaying, activeIndex, togglePlay, next, prev }
+  return { videoRef, currentTime, duration, isPlaying, activeIndex, togglePlay, next, prev, seekTo }
 }

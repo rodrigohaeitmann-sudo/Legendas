@@ -3,7 +3,6 @@ import type { Toggles, TrackKey } from '../types'
 interface Props {
   toggles: Toggles
   onToggle: (key: TrackKey) => void
-  onChangeFiles: () => void
 }
 
 const LABELS: Record<TrackKey, string> = {
@@ -12,24 +11,19 @@ const LABELS: Record<TrackKey, string> = {
   pt: 'PT',
 }
 
-export default function SubtitleToggles({ toggles, onToggle, onChangeFiles }: Props) {
+export default function SubtitleToggles({ toggles, onToggle }: Props) {
   return (
     <div className="toggles">
-      <div className="chips">
-        {(Object.keys(LABELS) as TrackKey[]).map((key) => (
-          <button
-            key={key}
-            className={`chip ${toggles[key] ? 'chip-on' : ''}`}
-            aria-pressed={toggles[key]}
-            onClick={() => onToggle(key)}
-          >
-            {LABELS[key]}
-          </button>
-        ))}
-      </div>
-      <button className="change-btn" aria-label="Trocar arquivos" onClick={onChangeFiles}>
-        Trocar
-      </button>
+      {(Object.keys(LABELS) as TrackKey[]).map((key) => (
+        <button
+          key={key}
+          className={`chip ${toggles[key] ? 'chip-on' : ''}`}
+          aria-pressed={toggles[key]}
+          onClick={() => onToggle(key)}
+        >
+          {LABELS[key]}
+        </button>
+      ))}
     </div>
   )
 }

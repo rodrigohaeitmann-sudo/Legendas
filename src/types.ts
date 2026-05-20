@@ -21,3 +21,9 @@ export interface LoadedMedia {
   videoId: string
   cues: MergedCue[]
 }
+
+export interface Settings {
+  fontScale: number
+  fontFamily: 'system' | 'serif' | 'mono'
+  speed: number
+}

@@ -109,6 +109,7 @@ button {
 }
 
 .video-wrap {
+  position: relative;
   background: #000;
   width: 100%;
 }
@@ -121,30 +122,77 @@ button {
   background: #000;
 }
 
-.toggles {
+.overlay {
+  position: absolute;
+  inset: 0;
   display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 12px 16px;
-  border-bottom: 1px solid #232733;
+  flex-direction: column;
+  justify-content: space-between;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s ease;
+  background: linear-gradient(
+    to bottom,
+    rgba(0, 0, 0, 0.5),
+    transparent 22%,
+    transparent 68%,
+    rgba(0, 0, 0, 0.6)
+  );
 }
 
-.chips {
-  flex: 1;
+.overlay-on {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.overlay-top {
   display: flex;
-  gap: 8px;
+  justify-content: space-between;
+  padding: calc(8px + env(safe-area-inset-top)) 10px 0;
+}
+
+.ov-btn {
+  width: 42px;
+  height: 42px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.45);
+  color: #fff;
+  font-size: 20px;
+  display: flex;
+  align-items: center;
   justify-content: center;
 }
 
-.change-btn {
-  flex-shrink: 0;
-  background: transparent;
-  color: var(--muted);
-  border: 1px solid #2a2f3a;
-  border-radius: 999px;
-  padding: 8px 12px;
+.overlay-bottom {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 14px 12px;
+}
+
+.seek {
+  flex: 1;
+  height: 22px;
+  accent-color: var(--accent);
+}
+
+.time {
+  color: #fff;
   font-size: 12px;
-  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  min-width: 38px;
+  text-align: center;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+}
+
+.toggles {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 12px 16px;
+  border-bottom: 1px solid #232733;
 }
 
 .splash {
@@ -179,6 +227,7 @@ button {
   gap: 14px;
   padding: 20px 22px;
   text-align: center;
+  font-family: var(--sub-font, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif);
 }
 
 .subtitle-empty {
@@ -192,18 +241,18 @@ button {
 
 .line-ipa {
   color: var(--ipa);
-  font-size: 19px;
+  font-size: calc(19px * var(--sub-scale, 1));
 }
 
 .line-en {
   color: var(--en);
-  font-size: 22px;
+  font-size: calc(22px * var(--sub-scale, 1));
   font-weight: 600;
 }
 
 .line-pt {
   color: var(--pt);
-  font-size: 18px;
+  font-size: calc(18px * var(--sub-scale, 1));
 }
 
 .controls {
@@ -239,4 +288,79 @@ button {
 
 .ctrl:active {
   transform: scale(0.94);
+}
+
+/* ---------- Settings modal ---------- */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: flex-end;
+}
+
+.modal {
+  width: 100%;
+  background: var(--panel);
+  border-radius: 18px 18px 0 0;
+  padding: 18px 18px calc(24px + env(safe-area-inset-bottom));
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.modal-head h2 {
+  font-size: 18px;
+}
+
+.close-btn {
+  width: 36px;
+  height: 36px;
+  border: none;
+  border-radius: 50%;
+  background: #232733;
+  color: var(--text);
+  font-size: 15px;
+}
+
+.setting {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.setting-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.opt-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.opt {
+  flex: 1;
+  min-width: 64px;
+  background: #232733;
+  color: var(--text);
+  border: 1px solid transparent;
+  border-radius: 10px;
+  padding: 10px 8px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.opt-on {
+  background: var(--accent);
+  color: #fff;
 }

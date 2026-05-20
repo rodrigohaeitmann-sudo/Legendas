@@ -1,0 +1,15 @@
+1
+00:00:00,000 --> 00:00:02,500
+Olá, como você está hoje?
+
+2
+00:00:02,500 --> 00:00:05,000
+Estou ótimo, obrigado por perguntar.
+
+3
+00:00:05,000 --> 00:00:08,000
+Você quer tomar um café?
+
+4
+00:00:08,000 --> 00:00:10,500
+Claro, isso parece maravilhoso.

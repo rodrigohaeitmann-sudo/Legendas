@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import type { LoadedMedia, Toggles, TrackKey } from './types'
 import { usePlayer } from './hooks/usePlayer'
+import { loadSession, clearSession } from './lib/sessionStore'
 import FileSetup from './components/FileSetup'
 import VideoPlayer from './components/VideoPlayer'
 import SubtitleToggles from './components/SubtitleToggles'
@@ -22,11 +23,28 @@ function loadToggles(): Toggles {
 
 export default function App() {
   const [media, setMedia] = useState<LoadedMedia | null>(null)
+  const [restoring, setRestoring] = useState(true)
   const [toggles, setToggles] = useState<Toggles>(loadToggles)
 
   useEffect(() => {
     localStorage.setItem(TOGGLES_KEY, JSON.stringify(toggles))
   }, [toggles])
+
+  // Reopen the last session automatically (e.g. after the app is backgrounded).
+  useEffect(() => {
+    loadSession()
+      .then((session) => {
+        if (session) {
+          setMedia({
+            videoUrl: URL.createObjectURL(session.videoBlob),
+            videoId: session.videoId,
+            cues: session.cues,
+          })
+        }
+      })
+      .catch(() => undefined)
+      .finally(() => setRestoring(false))
+  }, [])
 
   const cues = media?.cues ?? []
   const { videoRef, isPlaying, activeIndex, togglePlay, next, prev } = usePlayer(
@@ -38,6 +56,16 @@ export default function App() {
     setToggles((t) => ({ ...t, [key]: !t[key] }))
   }
 
+  function handleChangeFiles() {
+    if (media) URL.revokeObjectURL(media.videoUrl)
+    void clearSession()
+    setMedia(null)
+  }
+
+  if (restoring) {
+    return <div className="splash" />
+  }
+
   if (!media) {
     return <FileSetup onReady={setMedia} />
   }
@@ -47,7 +75,7 @@ export default function App() {
   return (
     <div className="player">
       <VideoPlayer videoRef={videoRef} src={media.videoUrl} />
-      <SubtitleToggles toggles={toggles} onToggle={handleToggle} />
+      <SubtitleToggles toggles={toggles} onToggle={handleToggle} onChangeFiles={handleChangeFiles} />
       <SubtitlePanel cue={currentCue} toggles={toggles} />
       <ControlsFooter
         isPlaying={isPlaying}

@@ -19,12 +19,13 @@ export function usePlayer(cues: MergedCue[], videoId?: string) {
     video.addEventListener('timeupdate', onTime)
     video.addEventListener('play', onPlay)
     video.addEventListener('pause', onPause)
+    setIsPlaying(!video.paused)
     return () => {
       video.removeEventListener('timeupdate', onTime)
       video.removeEventListener('play', onPlay)
       video.removeEventListener('pause', onPause)
     }
-  }, [])
+  }, [videoId])
 
   // Persist playback position per video so it resumes where it stopped.
   useEffect(() => {

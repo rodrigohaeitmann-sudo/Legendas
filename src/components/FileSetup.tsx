@@ -2,6 +2,7 @@ import { useState } from 'react'
 import type { LoadedMedia } from '../types'
 import { parseSubtitles } from '../lib/parseSubtitles'
 import { mergeCues } from '../lib/mergeCues'
+import { saveSession } from '../lib/sessionStore'
 
 interface Props {
   onReady: (media: LoadedMedia) => void
@@ -27,11 +28,14 @@ export default function FileSetup({ onReady }: Props) {
         setError('Não encontrei legendas no arquivo de inglês. Verifique o formato (.srt/.vtt).')
         return
       }
-      onReady({
-        videoUrl: URL.createObjectURL(video),
-        videoId: `${video.name}:${video.size}`,
-        cues: mergeCues(en, pt, ipa),
-      })
+      const cues = mergeCues(en, pt, ipa)
+      const videoId = `${video.name}:${video.size}`
+      try {
+        await saveSession({ videoId, videoBlob: video, cues })
+      } catch {
+        // best-effort: storage quota or private mode; app still works this session
+      }
+      onReady({ videoUrl: URL.createObjectURL(video), videoId, cues })
     } catch {
       setError('Falha ao ler os arquivos de legenda.')
     }

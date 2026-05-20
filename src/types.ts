@@ -18,5 +18,6 @@ export type Toggles = Record<TrackKey, boolean>
 
 export interface LoadedMedia {
   videoUrl: string
+  videoId: string
   cues: MergedCue[]
 }

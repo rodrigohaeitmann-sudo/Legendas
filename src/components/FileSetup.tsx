@@ -29,6 +29,7 @@ export default function FileSetup({ onReady }: Props) {
       }
       onReady({
         videoUrl: URL.createObjectURL(video),
+        videoId: `${video.name}:${video.size}`,
         cues: mergeCues(en, pt, ipa),
       })
     } catch {

@@ -29,7 +29,10 @@ export default function App() {
   }, [toggles])
 
   const cues = media?.cues ?? []
-  const { videoRef, isPlaying, activeIndex, togglePlay, next, prev } = usePlayer(cues)
+  const { videoRef, isPlaying, activeIndex, togglePlay, next, prev } = usePlayer(
+    cues,
+    media?.videoId,
+  )
 
   function handleToggle(key: TrackKey) {
     setToggles((t) => ({ ...t, [key]: !t[key] }))

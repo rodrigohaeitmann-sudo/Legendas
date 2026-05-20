@@ -5,7 +5,7 @@ import type { MergedCue } from '../types'
 // it instead of jumping to the previous cue ("repeat the line" behaviour).
 const REPEAT_THRESHOLD = 1
 
-export function usePlayer(cues: MergedCue[]) {
+export function usePlayer(cues: MergedCue[], videoId?: string) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const [currentTime, setCurrentTime] = useState(0)
   const [isPlaying, setIsPlaying] = useState(false)
@@ -25,6 +25,48 @@ export function usePlayer(cues: MergedCue[]) {
       video.removeEventListener('pause', onPause)
     }
   }, [])
+
+  // Persist playback position per video so it resumes where it stopped.
+  useEffect(() => {
+    const video = videoRef.current
+    if (!video || !videoId) return
+    const key = `legendas.progress.${videoId}`
+
+    const restore = () => {
+      const saved = Number(localStorage.getItem(key))
+      if (saved > 1 && (!video.duration || saved < video.duration - 1)) {
+        video.currentTime = saved
+      }
+    }
+    if (video.readyState >= 1) restore()
+    else video.addEventListener('loadedmetadata', restore, { once: true })
+
+    let lastSaved = 0
+    const save = () => {
+      if (video.currentTime > 0) localStorage.setItem(key, String(video.currentTime))
+    }
+    const onTime = () => {
+      const now = Date.now()
+      if (now - lastSaved > 4000) {
+        lastSaved = now
+        save()
+      }
+    }
+    const onHidden = () => {
+      if (document.hidden) save()
+    }
+    video.addEventListener('timeupdate', onTime)
+    video.addEventListener('pause', save)
+    window.addEventListener('pagehide', save)
+    document.addEventListener('visibilitychange', onHidden)
+    return () => {
+      video.removeEventListener('loadedmetadata', restore)
+      video.removeEventListener('timeupdate', onTime)
+      video.removeEventListener('pause', save)
+      window.removeEventListener('pagehide', save)
+      document.removeEventListener('visibilitychange', onHidden)
+    }
+  }, [videoId])
 
   // Index of the active cue, or the next upcoming one when in a gap. -1 before the first.
   const activeIndex = (() => {

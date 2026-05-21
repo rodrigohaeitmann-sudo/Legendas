@@ -394,3 +394,102 @@ button {
   font-size: 12px;
   color: var(--muted);
 }
+
+/* ---------- Tappable English words ---------- */
+.word {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  padding: 0 1px;
+  margin: 0;
+  cursor: pointer;
+  border-radius: 4px;
+  -webkit-tap-highlight-color: transparent;
+  transition: background 0.12s;
+}
+
+.word:active {
+  background: rgba(79, 140, 255, 0.35);
+}
+
+/* ---------- Word popup (bottom sheet) ---------- */
+.word-sheet-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: flex-end;
+}
+
+.word-sheet {
+  width: 100%;
+  background: var(--panel);
+  border-radius: 18px 18px 0 0;
+  padding: 18px 20px calc(22px + env(safe-area-inset-bottom));
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  text-align: left;
+}
+
+.word-sheet-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.word-sheet-term {
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--en);
+}
+
+.word-sheet-listen {
+  flex-shrink: 0;
+  border: none;
+  border-radius: 999px;
+  padding: 9px 16px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.word-sheet-ipa {
+  color: var(--ipa);
+  font-size: 18px;
+}
+
+.word-sheet-trans {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.word-sheet-trans li {
+  background: #232733;
+  color: var(--pt);
+  padding: 6px 12px;
+  border-radius: 999px;
+  font-size: 16px;
+}
+
+.word-sheet-status {
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.word-sheet-close {
+  margin-top: 4px;
+  border: none;
+  border-radius: 12px;
+  padding: 12px;
+  background: #232733;
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 600;
+}

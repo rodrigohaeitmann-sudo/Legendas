@@ -30,12 +30,12 @@ export default function FileSetup({ onReady }: Props) {
       }
       const cues = mergeCues(en, pt, ipa)
       const videoId = `${video.name}:${video.size}`
-      try {
-        await saveSession({ videoId, videoBlob: video, cues })
-      } catch {
-        // best-effort: storage quota or private mode; app still works this session
-      }
+      // Show the video immediately; persist for auto-reopen in the background so
+      // a large file write doesn't block playback.
       onReady({ videoUrl: URL.createObjectURL(video), videoId, cues })
+      void saveSession({ videoId, videoBlob: video, cues }).catch(() => {
+        // best-effort: storage quota or private mode; app still works this session
+      })
     } catch {
       setError('Falha ao ler os arquivos de legenda.')
     }

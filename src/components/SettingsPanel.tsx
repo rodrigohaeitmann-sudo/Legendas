@@ -3,8 +3,12 @@ import type { Settings } from '../types'
 interface Props {
   settings: Settings
   onChange: (settings: Settings) => void
+  offset: number
+  onOffsetChange: (offset: number) => void
   onClose: () => void
 }
+
+const round2 = (n: number) => Math.round(n * 100) / 100
 
 const SCALES: { label: string; value: number }[] = [
   { label: 'Pequeno', value: 0.85 },
@@ -26,7 +30,13 @@ const SPEEDS: { label: string; value: number }[] = [
   { label: '1,5×', value: 1.5 },
 ]
 
-export default function SettingsPanel({ settings, onChange, onClose }: Props) {
+export default function SettingsPanel({
+  settings,
+  onChange,
+  offset,
+  onOffsetChange,
+  onClose,
+}: Props) {
   const set = (patch: Partial<Settings>) => onChange({ ...settings, ...patch })
 
   return (
@@ -82,6 +92,27 @@ export default function SettingsPanel({ settings, onChange, onClose }: Props) {
               </button>
             ))}
           </div>
+        </div>
+
+        <div className="setting">
+          <span className="setting-label">Sincronizar legenda (segundos)</span>
+          <div className="offset-row">
+            <button className="opt offset-btn" aria-label="Adiantar legenda" onClick={() => onOffsetChange(round2(offset - 0.25))}>
+              −
+            </button>
+            <input
+              className="offset-input"
+              type="number"
+              step="0.25"
+              inputMode="decimal"
+              value={offset}
+              onChange={(e) => onOffsetChange(round2(Number(e.target.value) || 0))}
+            />
+            <button className="opt offset-btn" aria-label="Atrasar legenda" onClick={() => onOffsetChange(round2(offset + 0.25))}>
+              +
+            </button>
+          </div>
+          <span className="setting-hint">+ atrasa a legenda · − adianta · 0 = sem ajuste</span>
         </div>
       </div>
     </div>

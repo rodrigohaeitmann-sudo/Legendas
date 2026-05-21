@@ -5,7 +5,7 @@ import type { MergedCue } from '../types'
 // it instead of jumping to the previous cue ("repeat the line" behaviour).
 const REPEAT_THRESHOLD = 1
 
-export function usePlayer(cues: MergedCue[], videoId?: string) {
+export function usePlayer(cues: MergedCue[], videoId?: string, offset = 0) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const [currentTime, setCurrentTime] = useState(0)
   const [duration, setDuration] = useState(0)
@@ -76,12 +76,15 @@ export function usePlayer(cues: MergedCue[], videoId?: string) {
     }
   }, [videoId])
 
+  // Cue timings shifted by the sync offset (positive = subtitles delayed).
+  const adjusted = currentTime - offset
+
   // Index of the active cue, or the next upcoming one when in a gap. -1 before the first.
   const activeIndex = (() => {
     if (cues.length === 0) return -1
-    const within = cues.findIndex((c) => currentTime >= c.start && currentTime < c.end)
+    const within = cues.findIndex((c) => adjusted >= c.start && adjusted < c.end)
     if (within !== -1) return within
-    const upcoming = cues.findIndex((c) => c.start > currentTime)
+    const upcoming = cues.findIndex((c) => c.start > adjusted)
     if (upcoming !== -1) return Math.max(0, upcoming - 1)
     return cues.length - 1
   })()
@@ -100,23 +103,23 @@ export function usePlayer(cues: MergedCue[], videoId?: string) {
 
   const next = useCallback(() => {
     if (activeIndex === -1 || cues.length === 0) {
-      if (cues[0]) seekTo(cues[0].start)
+      if (cues[0]) seekTo(cues[0].start + offset)
       return
     }
     const target = cues[activeIndex + 1]
-    if (target) seekTo(target.start)
-  }, [activeIndex, cues, seekTo])
+    if (target) seekTo(target.start + offset)
+  }, [activeIndex, cues, offset, seekTo])
 
   const prev = useCallback(() => {
     if (activeIndex === -1 || cues.length === 0) return
     const current = cues[activeIndex]
-    if (currentTime - current.start > REPEAT_THRESHOLD) {
-      seekTo(current.start)
+    if (adjusted - current.start > REPEAT_THRESHOLD) {
+      seekTo(current.start + offset)
       return
     }
     const target = cues[activeIndex - 1]
-    seekTo(target ? target.start : current.start)
-  }, [activeIndex, cues, currentTime, seekTo])
+    seekTo((target ? target.start : current.start) + offset)
+  }, [activeIndex, adjusted, cues, offset, seekTo])
 
   return { videoRef, currentTime, duration, isPlaying, activeIndex, togglePlay, next, prev, seekTo }
 }

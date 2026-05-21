@@ -30,11 +30,22 @@ function loadJson<T>(key: string, fallback: T): T {
   return fallback
 }
 
+function offsetKey(videoId?: string) {
+  return videoId ? `legendas.offset.${videoId}` : ''
+}
+
+function loadOffset(videoId?: string): number {
+  if (!videoId) return 0
+  const n = Number(localStorage.getItem(offsetKey(videoId)))
+  return Number.isFinite(n) ? n : 0
+}
+
 export default function App() {
   const [media, setMedia] = useState<LoadedMedia | null>(null)
   const [restoring, setRestoring] = useState(true)
   const [toggles, setToggles] = useState<Toggles>(() => loadJson(TOGGLES_KEY, DEFAULT_TOGGLES))
   const [settings, setSettings] = useState<Settings>(() => loadJson(SETTINGS_KEY, DEFAULT_SETTINGS))
+  const [offset, setOffset] = useState(0)
   const [showSettings, setShowSettings] = useState(false)
 
   useEffect(() => {
@@ -61,9 +72,19 @@ export default function App() {
       .finally(() => setRestoring(false))
   }, [])
 
+  // Subtitle sync offset is per-video; load it when the video changes.
+  useEffect(() => {
+    setOffset(loadOffset(media?.videoId))
+  }, [media?.videoId])
+
+  useEffect(() => {
+    const key = offsetKey(media?.videoId)
+    if (key) localStorage.setItem(key, String(offset))
+  }, [offset, media?.videoId])
+
   const cues = media?.cues ?? []
   const { videoRef, currentTime, duration, isPlaying, activeIndex, togglePlay, next, prev, seekTo } =
-    usePlayer(cues, media?.videoId)
+    usePlayer(cues, media?.videoId, offset)
 
   useEffect(() => {
     if (videoRef.current) videoRef.current.playbackRate = settings.speed
@@ -116,6 +137,8 @@ export default function App() {
         <SettingsPanel
           settings={settings}
           onChange={setSettings}
+          offset={offset}
+          onOffsetChange={setOffset}
           onClose={() => setShowSettings(false)}
         />
       )}

@@ -2,7 +2,7 @@ import { useState } from 'react'
 import type { LoadedMedia } from '../types'
 import { parseSubtitles } from '../lib/parseSubtitles'
 import { mergeCues } from '../lib/mergeCues'
-import { saveSession } from '../lib/sessionStore'
+import { clearSession, saveSession } from '../lib/sessionStore'
 
 interface Props {
   onReady: (media: LoadedMedia) => void
@@ -30,8 +30,12 @@ export default function FileSetup({ onReady }: Props) {
       }
       const cues = mergeCues(en, pt, ipa)
       const videoId = `${video.name}:${video.size}`
-      // Show the video immediately; persist for auto-reopen in the background so
-      // a large file write doesn't block playback.
+      // Drop any previous persisted session before kicking off the new save.
+      // The save runs in the background (so big files don't block playback);
+      // clearing first guarantees that if the new save is interrupted before
+      // it completes, the next launch falls back to FileSetup instead of
+      // auto-reopening the *previous* video.
+      await clearSession().catch(() => undefined)
       onReady({ videoUrl: URL.createObjectURL(video), videoId, cues })
       void saveSession({ videoId, videoBlob: video, cues }).catch(() => {
         // best-effort: storage quota or private mode; app still works this session

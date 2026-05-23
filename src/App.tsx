@@ -1,7 +1,7 @@
 import { useEffect, useState, type CSSProperties } from 'react'
 import type { LoadedMedia, Settings, Toggles, TrackKey } from './types'
 import { usePlayer } from './hooks/usePlayer'
-import { loadSession } from './lib/sessionStore'
+import { clearSession, loadSession } from './lib/sessionStore'
 import FileSetup from './components/FileSetup'
 import VideoStage from './components/VideoStage'
 import SubtitleToggles from './components/SubtitleToggles'
@@ -97,6 +97,9 @@ export default function App() {
   function handleBack() {
     if (media) URL.revokeObjectURL(media.videoUrl)
     setMedia(null)
+    // Drop the persisted session so the next launch shows FileSetup instead of
+    // auto-reopening the video the user just left.
+    void clearSession().catch(() => undefined)
   }
 
   if (restoring) {

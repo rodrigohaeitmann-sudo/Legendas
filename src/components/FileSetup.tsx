@@ -9,14 +9,25 @@ interface Props {
   onReady: (media: LoadedMedia) => void
 }
 
+const EMAIL_KEY = 'legendas:mymemoryEmail'
+
 export default function FileSetup({ onReady }: Props) {
   const [video, setVideo] = useState<File | null>(null)
   const [enFile, setEnFile] = useState<File | null>(null)
+  const [email, setEmail] = useState(() => localStorage.getItem(EMAIL_KEY) ?? '')
+  const [showAdvanced, setShowAdvanced] = useState(false)
   const [error, setError] = useState('')
   const [progress, setProgress] = useState<TranslationProgress | null>(null)
   const abortRef = useRef<AbortController | null>(null)
 
   const canStart = video !== null && enFile !== null && progress === null
+
+  function updateEmail(value: string) {
+    setEmail(value)
+    const trimmed = value.trim()
+    if (trimmed) localStorage.setItem(EMAIL_KEY, trimmed)
+    else localStorage.removeItem(EMAIL_KEY)
+  }
 
   async function handleStart() {
     if (!video || !enFile) return
@@ -30,7 +41,7 @@ export default function FileSetup({ onReady }: Props) {
         return
       }
 
-      setProgress({ done: 0, total: enCues.length, failed: 0 })
+      setProgress({ done: 0, total: enCues.length, failed: 0, provider: null })
 
       const enTexts = enCues.map((c) => c.text)
 
@@ -39,6 +50,7 @@ export default function FileSetup({ onReady }: Props) {
       const ptPromise = translateLines(enTexts, {
         signal: controller.signal,
         onProgress: setProgress,
+        email: email.trim() || undefined,
       })
 
       const [ipaLines, ptLines] = await Promise.all([ipaPromise, ptPromise])
@@ -105,6 +117,32 @@ export default function FileSetup({ onReady }: Props) {
         {enFile && <small>{enFile.name}</small>}
       </label>
 
+      <button
+        type="button"
+        className="advanced-toggle"
+        onClick={() => setShowAdvanced((v) => !v)}
+      >
+        {showAdvanced ? '− Avançado' : '+ Avançado'}
+      </button>
+
+      {showAdvanced && (
+        <label className="file-field">
+          <span>E-mail (opcional)</span>
+          <input
+            type="email"
+            placeholder="seu@email.com"
+            value={email}
+            onChange={(e) => updateEmail(e.target.value)}
+            autoComplete="email"
+            inputMode="email"
+          />
+          <small>
+            Sobe o limite diário gratuito do MyMemory para 50 mil palavras. Se a cota acabar
+            mesmo assim, a tradução continua automaticamente pelo Google Translate.
+          </small>
+        </label>
+      )}
+
       {error && <p className="setup-error">{error}</p>}
 
       <button className="start-btn" disabled={!canStart} onClick={handleStart}>
@@ -124,6 +162,8 @@ function ProgressOverlay({
   onCancel: () => void
 }) {
   const pct = progress.total > 0 ? Math.round((progress.done / progress.total) * 100) : 0
+  const providerLabel =
+    progress.provider === 'google' ? 'Google' : progress.provider === 'mymemory' ? 'MyMemory' : null
   return (
     <div className="progress-backdrop">
       <div className="progress-card">
@@ -131,6 +171,7 @@ function ProgressOverlay({
         <p className="progress-count">
           {progress.done}/{progress.total} linhas
           {progress.failed > 0 && ` · ${progress.failed} falharam`}
+          {providerLabel && ` · via ${providerLabel}`}
         </p>
         <div className="progress-bar">
           <div className="progress-bar-fill" style={{ width: `${pct}%` }} />

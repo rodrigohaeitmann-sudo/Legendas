@@ -1,6 +1,8 @@
 import { cacheGet, cacheSet } from './translateCache'
+import type { SourceLang } from './detectLang'
 
 const CONCURRENCY = 4
+const TARGET = 'pt-BR'
 
 export interface TranslationProgress {
   done: number
@@ -15,6 +17,7 @@ export interface TranslateOptions {
   signal?: AbortSignal
   onProgress?: (p: TranslationProgress) => void
   email?: string
+  source?: SourceLang
 }
 
 class QuotaError extends Error {
@@ -29,8 +32,13 @@ interface MyMemoryResponse {
   responseData?: { translatedText?: string }
 }
 
-async function viaMyMemory(text: string, email: string | undefined, signal?: AbortSignal): Promise<string> {
-  const params = new URLSearchParams({ q: text, langpair: 'en|pt-BR' })
+async function viaMyMemory(
+  text: string,
+  source: SourceLang,
+  email: string | undefined,
+  signal?: AbortSignal,
+): Promise<string> {
+  const params = new URLSearchParams({ q: text, langpair: `${source}|${TARGET}` })
   if (email) params.set('de', email)
   const res = await fetch(`https://api.mymemory.translated.net/get?${params.toString()}`, { signal })
   if (!res.ok) {
@@ -49,11 +57,11 @@ async function viaMyMemory(text: string, email: string | undefined, signal?: Abo
 // Public Google Translate endpoint used by translate-shell and similar tools.
 // No API key, supports CORS, returns chunked JSON. Rate-limits on heavy abuse
 // (HTTP 429) but otherwise has no documented daily quota.
-async function viaGoogle(text: string, signal?: AbortSignal): Promise<string> {
+async function viaGoogle(text: string, source: SourceLang, signal?: AbortSignal): Promise<string> {
   const params = new URLSearchParams({
     client: 'gtx',
-    sl: 'en',
-    tl: 'pt-BR',
+    sl: source,
+    tl: TARGET,
     dt: 't',
     q: text,
   })
@@ -81,7 +89,7 @@ class Runner {
   private dead = new Set<ProviderId>()
   current: ProviderId = 'mymemory'
 
-  constructor(private email?: string) {}
+  constructor(private source: SourceLang, private email?: string) {}
 
   private order(): ProviderId[] {
     const all: ProviderId[] = ['mymemory', 'google']
@@ -92,7 +100,10 @@ class Runner {
     let lastErr: unknown
     for (const p of this.order()) {
       try {
-        const t = p === 'mymemory' ? await viaMyMemory(text, this.email, signal) : await viaGoogle(text, signal)
+        const t =
+          p === 'mymemory'
+            ? await viaMyMemory(text, this.source, this.email, signal)
+            : await viaGoogle(text, this.source, signal)
         this.current = p
         return t
       } catch (e) {
@@ -115,11 +126,18 @@ function flatten(text: string): string {
   return text.replace(/\s+/g, ' ').trim()
 }
 
+// Cache key namespaces translations by source language so the same surface
+// text in different source languages doesn't collide (e.g. "Pi" in en vs it).
+function cacheKey(source: SourceLang, text: string): string {
+  return `${source}\t${text}`
+}
+
 export async function translateLines(
   lines: string[],
   opts: TranslateOptions = {},
 ): Promise<string[]> {
-  const runner = new Runner(opts.email)
+  const source: SourceLang = opts.source ?? 'en'
+  const runner = new Runner(source, opts.email)
   const results = new Array<string>(lines.length).fill('')
   let done = 0
   let failed = 0
@@ -141,7 +159,8 @@ export async function translateLines(
         report()
         continue
       }
-      const cached = await cacheGet(flat)
+      const key = cacheKey(source, flat)
+      const cached = await cacheGet(key)
       if (cached !== null) {
         results[i] = cached
         done++
@@ -151,7 +170,7 @@ export async function translateLines(
       try {
         const t = await runner.translate(flat, opts.signal)
         results[i] = t
-        void cacheSet(flat, t)
+        void cacheSet(key, t)
       } catch {
         results[i] = ''
         failed++

@@ -4,6 +4,12 @@ import { parseSubtitles } from '../lib/parseSubtitles'
 import { linesToIpa, preloadIpa } from '../lib/ipa'
 import { translateLines, type TranslationProgress } from '../lib/translateCues'
 import { clearSession, saveSession } from '../lib/sessionStore'
+import {
+  detectLang,
+  langLabel,
+  SUPPORTED_LANGS,
+  type SourceLang,
+} from '../lib/detectLang'
 
 interface Props {
   onReady: (media: LoadedMedia) => void
@@ -13,12 +19,21 @@ type SourceMode = 'file' | 'url'
 
 const EMAIL_KEY = 'legendas:mymemoryEmail'
 const URL_KEY = 'legendas:lastVideoUrl'
+const LANG_KEY = 'legendas:lastSourceLang'
+
+function loadLastLang(): SourceLang {
+  const stored = localStorage.getItem(LANG_KEY) as SourceLang | null
+  return SUPPORTED_LANGS.some((l) => l.code === stored) ? (stored as SourceLang) : 'en'
+}
 
 export default function FileSetup({ onReady }: Props) {
   const [sourceMode, setSourceMode] = useState<SourceMode>('file')
   const [videoFile, setVideoFile] = useState<File | null>(null)
   const [videoUrl, setVideoUrl] = useState(() => localStorage.getItem(URL_KEY) ?? '')
-  const [enFile, setEnFile] = useState<File | null>(null)
+  const [srtFile, setSrtFile] = useState<File | null>(null)
+  const [srtText, setSrtText] = useState('')
+  const [sourceLang, setSourceLang] = useState<SourceLang>(loadLastLang)
+  const [detectedLang, setDetectedLang] = useState<SourceLang | null>(null)
   const [email, setEmail] = useState(() => localStorage.getItem(EMAIL_KEY) ?? '')
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [error, setError] = useState('')
@@ -27,7 +42,7 @@ export default function FileSetup({ onReady }: Props) {
 
   const sourceReady =
     sourceMode === 'file' ? videoFile !== null : videoUrl.trim() !== ''
-  const canStart = sourceReady && enFile !== null && progress === null
+  const canStart = sourceReady && srtFile !== null && progress === null
 
   function updateEmail(value: string) {
     setEmail(value)
@@ -43,12 +58,36 @@ export default function FileSetup({ onReady }: Props) {
     else localStorage.removeItem(URL_KEY)
   }
 
+  function updateSourceLang(value: SourceLang) {
+    setSourceLang(value)
+    localStorage.setItem(LANG_KEY, value)
+  }
+
+  async function pickSrt(file: File | null) {
+    setSrtFile(file)
+    setDetectedLang(null)
+    if (!file) {
+      setSrtText('')
+      return
+    }
+    try {
+      const text = await file.text()
+      setSrtText(text)
+      const detected = detectLang(text)
+      setDetectedLang(detected)
+      if (detected) {
+        setSourceLang(detected)
+        localStorage.setItem(LANG_KEY, detected)
+      }
+    } catch {
+      setSrtText('')
+    }
+  }
+
   async function handleStart() {
-    if (!enFile) return
+    if (!srtFile || !srtText) return
     setError('')
 
-    // Resolve the video source up front so we can fail fast on a bad URL
-    // before kicking off the translation work.
     let mediaUrl: string
     let videoId: string
     let videoBlob: File | null = null
@@ -73,28 +112,34 @@ export default function FileSetup({ onReady }: Props) {
     const controller = new AbortController()
     abortRef.current = controller
     try {
-      const enCues = parseSubtitles(await enFile.text())
-      if (enCues.length === 0) {
-        setError('Não encontrei legendas no arquivo de inglês. Verifique o formato (.srt/.vtt).')
+      const srcCues = parseSubtitles(srtText)
+      if (srcCues.length === 0) {
+        setError('Não encontrei legendas no arquivo. Verifique o formato (.srt/.vtt).')
         return
       }
 
-      setProgress({ done: 0, total: enCues.length, failed: 0, provider: null })
+      setProgress({ done: 0, total: srcCues.length, failed: 0, provider: null })
 
-      const enTexts = enCues.map((c) => c.text)
+      const srcTexts = srcCues.map((c) => c.text)
 
-      // IPA is offline and fast; kick off the dict load while translation runs.
-      const ipaPromise = preloadIpa().then(() => linesToIpa(enTexts))
-      const ptPromise = translateLines(enTexts, {
+      // IPA dict only covers English. Skip the fetch entirely for other sources;
+      // the IPA row in the player simply stays empty.
+      const ipaPromise: Promise<string[]> =
+        sourceLang === 'en'
+          ? preloadIpa().then(() => linesToIpa(srcTexts))
+          : Promise.resolve(srcTexts.map(() => ''))
+
+      const ptPromise = translateLines(srcTexts, {
         signal: controller.signal,
         onProgress: setProgress,
         email: email.trim() || undefined,
+        source: sourceLang,
       })
 
       const [ipaLines, ptLines] = await Promise.all([ipaPromise, ptPromise])
       if (controller.signal.aborted) return
 
-      const cues: MergedCue[] = enCues.map((c, i) => ({
+      const cues: MergedCue[] = srcCues.map((c, i) => ({
         start: c.start,
         end: c.end,
         en: c.text,
@@ -125,12 +170,19 @@ export default function FileSetup({ onReady }: Props) {
     setProgress(null)
   }
 
+  const detectionHint =
+    detectedLang === null
+      ? null
+      : detectedLang === sourceLang
+        ? `Detectado automaticamente: ${langLabel(detectedLang)}.`
+        : `Detectado: ${langLabel(detectedLang)}.`
+
   return (
     <div className="setup">
       <h1>Treino de Listening</h1>
       <p className="setup-hint">
-        Escolha um vídeo local ou cole a URL do servidor do Stremio. A tradução em português e
-        a transcrição fonética (IPA) são geradas automaticamente.
+        Escolha um vídeo local ou cole a URL do servidor do Stremio. A tradução em português e,
+        para legendas em inglês, a transcrição fonética (IPA) são geradas automaticamente.
       </p>
 
       <div className="source-tabs">
@@ -180,13 +232,28 @@ export default function FileSetup({ onReady }: Props) {
       )}
 
       <label className="file-field">
-        <span>Legenda em inglês (.srt / .vtt)</span>
+        <span>Legenda (.srt / .vtt)</span>
         <input
           type="file"
           accept=".srt,.vtt"
-          onChange={(e) => setEnFile(e.target.files?.[0] ?? null)}
+          onChange={(e) => pickSrt(e.target.files?.[0] ?? null)}
         />
-        {enFile && <small>{enFile.name}</small>}
+        {srtFile && <small>{srtFile.name}</small>}
+      </label>
+
+      <label className="file-field">
+        <span>Idioma da legenda</span>
+        <select
+          value={sourceLang}
+          onChange={(e) => updateSourceLang(e.target.value as SourceLang)}
+        >
+          {SUPPORTED_LANGS.map((l) => (
+            <option key={l.code} value={l.code}>
+              {l.label}
+            </option>
+          ))}
+        </select>
+        {detectionHint && <small>{detectionHint}</small>}
       </label>
 
       <button

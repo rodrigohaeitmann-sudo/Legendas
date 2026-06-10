@@ -597,3 +597,12 @@ button {
   font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
   font-size: 13px;
 }
+
+.file-field select {
+  background: #1c1f27;
+  color: var(--text);
+  border: none;
+  border-radius: 8px;
+  padding: 9px 10px;
+  font-size: 14px;
+}

@@ -9,10 +9,15 @@ interface Props {
   onReady: (media: LoadedMedia) => void
 }
 
+type SourceMode = 'file' | 'url'
+
 const EMAIL_KEY = 'legendas:mymemoryEmail'
+const URL_KEY = 'legendas:lastVideoUrl'
 
 export default function FileSetup({ onReady }: Props) {
-  const [video, setVideo] = useState<File | null>(null)
+  const [sourceMode, setSourceMode] = useState<SourceMode>('file')
+  const [videoFile, setVideoFile] = useState<File | null>(null)
+  const [videoUrl, setVideoUrl] = useState(() => localStorage.getItem(URL_KEY) ?? '')
   const [enFile, setEnFile] = useState<File | null>(null)
   const [email, setEmail] = useState(() => localStorage.getItem(EMAIL_KEY) ?? '')
   const [showAdvanced, setShowAdvanced] = useState(false)
@@ -20,7 +25,9 @@ export default function FileSetup({ onReady }: Props) {
   const [progress, setProgress] = useState<TranslationProgress | null>(null)
   const abortRef = useRef<AbortController | null>(null)
 
-  const canStart = video !== null && enFile !== null && progress === null
+  const sourceReady =
+    sourceMode === 'file' ? videoFile !== null : videoUrl.trim() !== ''
+  const canStart = sourceReady && enFile !== null && progress === null
 
   function updateEmail(value: string) {
     setEmail(value)
@@ -29,9 +36,40 @@ export default function FileSetup({ onReady }: Props) {
     else localStorage.removeItem(EMAIL_KEY)
   }
 
+  function updateVideoUrl(value: string) {
+    setVideoUrl(value)
+    const trimmed = value.trim()
+    if (trimmed) localStorage.setItem(URL_KEY, trimmed)
+    else localStorage.removeItem(URL_KEY)
+  }
+
   async function handleStart() {
-    if (!video || !enFile) return
+    if (!enFile) return
     setError('')
+
+    // Resolve the video source up front so we can fail fast on a bad URL
+    // before kicking off the translation work.
+    let mediaUrl: string
+    let videoId: string
+    let videoBlob: File | null = null
+    if (sourceMode === 'file') {
+      if (!videoFile) return
+      mediaUrl = URL.createObjectURL(videoFile)
+      videoId = `${videoFile.name}:${videoFile.size}`
+      videoBlob = videoFile
+    } else {
+      const url = videoUrl.trim()
+      try {
+        const parsed = new URL(url)
+        if (!/^https?:$/.test(parsed.protocol)) throw new Error('protocol')
+      } catch {
+        setError('URL inválida. Use http:// ou https://')
+        return
+      }
+      mediaUrl = url
+      videoId = `url:${url}`
+    }
+
     const controller = new AbortController()
     abortRef.current = controller
     try {
@@ -63,18 +101,16 @@ export default function FileSetup({ onReady }: Props) {
         pt: ptLines[i] ?? '',
         ipa: ipaLines[i] ?? '',
       }))
-      const videoId = `${video.name}:${video.size}`
 
-      // Drop any previous persisted session before kicking off the new save.
-      // The save runs in the background (so big files don't block playback);
-      // clearing first guarantees that if the new save is interrupted before
-      // it completes, the next launch falls back to FileSetup instead of
-      // auto-reopening the *previous* video.
+      // Always drop the previous persisted session: in URL mode we don't save
+      // a new one (no blob), and in file mode the save below replaces it.
       await clearSession().catch(() => undefined)
-      onReady({ videoUrl: URL.createObjectURL(video), videoId, cues })
-      void saveSession({ videoId, videoBlob: video, cues }).catch(() => {
-        // best-effort: storage quota or private mode; app still works this session
-      })
+      onReady({ videoUrl: mediaUrl, videoId, cues })
+      if (videoBlob) {
+        void saveSession({ videoId, videoBlob, cues }).catch(() => {
+          // best-effort: storage quota or private mode; app still works this session
+        })
+      }
     } catch {
       setError('Falha ao processar a legenda.')
       setProgress(null)
@@ -93,19 +129,55 @@ export default function FileSetup({ onReady }: Props) {
     <div className="setup">
       <h1>Treino de Listening</h1>
       <p className="setup-hint">
-        Selecione o vídeo e o arquivo de legenda em inglês. A tradução em português e a
-        transcrição fonética (IPA) são geradas automaticamente.
+        Escolha um vídeo local ou cole a URL do servidor do Stremio. A tradução em português e
+        a transcrição fonética (IPA) são geradas automaticamente.
       </p>
 
-      <label className="file-field">
-        <span>Vídeo (.mp4)</span>
-        <input
-          type="file"
-          accept="video/mp4,video/*"
-          onChange={(e) => setVideo(e.target.files?.[0] ?? null)}
-        />
-        {video && <small>{video.name}</small>}
-      </label>
+      <div className="source-tabs">
+        <button
+          type="button"
+          className={`source-tab ${sourceMode === 'file' ? 'active' : ''}`}
+          onClick={() => setSourceMode('file')}
+        >
+          Arquivo local
+        </button>
+        <button
+          type="button"
+          className={`source-tab ${sourceMode === 'url' ? 'active' : ''}`}
+          onClick={() => setSourceMode('url')}
+        >
+          URL (Stremio)
+        </button>
+      </div>
+
+      {sourceMode === 'file' ? (
+        <label className="file-field">
+          <span>Vídeo (.mp4)</span>
+          <input
+            type="file"
+            accept="video/mp4,video/*"
+            onChange={(e) => setVideoFile(e.target.files?.[0] ?? null)}
+          />
+          {videoFile && <small>{videoFile.name}</small>}
+        </label>
+      ) : (
+        <label className="file-field">
+          <span>URL do vídeo</span>
+          <input
+            type="url"
+            placeholder="http://127.0.0.1:11470/..."
+            value={videoUrl}
+            onChange={(e) => updateVideoUrl(e.target.value)}
+            autoComplete="off"
+            inputMode="url"
+          />
+          <small>
+            Capture a URL no Stremio Android via "Reproduzir em player externo" + um app de
+            intercept (ex.: Intent Intercept). Só toca no mesmo aparelho onde o servidor do
+            Stremio está rodando.
+          </small>
+        </label>
+      )}
 
       <label className="file-field">
         <span>Legenda em inglês (.srt / .vtt)</span>

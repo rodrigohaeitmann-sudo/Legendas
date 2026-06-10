@@ -567,3 +567,33 @@ button {
 .advanced-toggle:hover {
   color: var(--text);
 }
+
+.source-tabs {
+  display: flex;
+  gap: 6px;
+  background: #1c1f27;
+  border-radius: 10px;
+  padding: 4px;
+}
+
+.source-tab {
+  flex: 1;
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  padding: 9px 12px;
+  border-radius: 7px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.source-tab.active {
+  background: var(--panel);
+  color: var(--text);
+}
+
+.file-field input[type='url'] {
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 13px;
+}

@@ -9,7 +9,9 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "espeak-ng": "^1.0.2",
     "franc-min": "^6.2.0",
+    "phonemize": "^1.2.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
@@ -17,7 +19,6 @@
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
-    "cmu-pronouncing-dictionary": "^3.0.0",
     "typescript": "^5.6.3",
     "vite": "^5.4.11"
   }

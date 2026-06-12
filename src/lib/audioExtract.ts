@@ -16,9 +16,18 @@ export interface ExtractProgress {
 }
 
 // Files served from public/ via vite-plugin-static-copy (see vite.config.ts).
-// Using BASE_URL keeps the paths correct under the './' base config.
-const CORE_URL = `${import.meta.env.BASE_URL}ffmpeg/ffmpeg-core.js`
-const WASM_URL = `${import.meta.env.BASE_URL}ffmpeg/ffmpeg-core.wasm`
+// `base: './'` in vite.config makes BASE_URL relative, which breaks when the
+// FFmpeg internal module-worker does `await import(coreURL)`: a relative URL
+// would resolve against the worker's own URL (under /assets/) instead of the
+// page directory. Always pass an absolute URL.
+const CORE_URL = new URL(
+  `${import.meta.env.BASE_URL}ffmpeg/ffmpeg-core.js`,
+  document.baseURI,
+).toString()
+const WASM_URL = new URL(
+  `${import.meta.env.BASE_URL}ffmpeg/ffmpeg-core.wasm`,
+  document.baseURI,
+).toString()
 
 let ffmpegPromise: Promise<import('@ffmpeg/ffmpeg').FFmpeg> | null = null
 

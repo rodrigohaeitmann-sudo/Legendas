@@ -15,39 +15,49 @@ export interface ExtractProgress {
   ratio: number | null
 }
 
-// Files served from public/ via vite-plugin-static-copy (see vite.config.ts).
-// `base: './'` in vite.config makes BASE_URL relative, which breaks when the
-// FFmpeg internal module-worker does `await import(coreURL)`: a relative URL
-// would resolve against the worker's own URL (under /assets/) instead of the
-// page directory. Always pass an absolute URL.
-const CORE_URL = new URL(
-  `${import.meta.env.BASE_URL}ffmpeg/ffmpeg-core.js`,
-  document.baseURI,
-).toString()
-const WASM_URL = new URL(
-  `${import.meta.env.BASE_URL}ffmpeg/ffmpeg-core.wasm`,
-  document.baseURI,
-).toString()
-
 let ffmpegPromise: Promise<import('@ffmpeg/ffmpeg').FFmpeg> | null = null
 
 async function getFfmpeg() {
   if (!ffmpegPromise) {
     ffmpegPromise = (async () => {
-      const { FFmpeg } = await import('@ffmpeg/ffmpeg')
+      const [{ FFmpeg }, { toBlobURL }] = await Promise.all([
+        import('@ffmpeg/ffmpeg'),
+        import('@ffmpeg/util'),
+      ])
+
+      // Resolve in the main thread, where document.baseURI is the page URL.
+      // The FFmpeg internal worker lives under /assets/, so passing a
+      // relative URL to it would resolve against the worker location and
+      // produce /Legendas/assets/ffmpeg/... instead of /Legendas/ffmpeg/...
+      const coreSrc = new URL(
+        `${import.meta.env.BASE_URL}ffmpeg/ffmpeg-core.js`,
+        document.baseURI,
+      ).toString()
+      const wasmSrc = new URL(
+        `${import.meta.env.BASE_URL}ffmpeg/ffmpeg-core.wasm`,
+        document.baseURI,
+      ).toString()
+      console.debug('[ffmpeg] fetching core from', coreSrc, 'wasm from', wasmSrc)
+
+      // Convert to blob: URLs before handing them to ffmpeg. blob: URLs
+      // have no path, so they can't be misresolved by code running in a
+      // worker context — this is the canonical workaround the ffmpeg.wasm
+      // team recommends for Vite/webpack deployments.
+      const [coreURL, wasmURL] = await Promise.all([
+        toBlobURL(coreSrc, 'text/javascript'),
+        toBlobURL(wasmSrc, 'application/wasm'),
+      ])
+
       const ffmpeg = new FFmpeg()
-      // Forward ffmpeg's own log/stderr so a real failure (e.g. an unknown
-      // codec) shows up in the console instead of just our generic "exec
-      // returned non-zero" error.
       ffmpeg.on('log', ({ message }) => {
         if (message) console.debug('[ffmpeg]', message)
       })
       try {
-        await ffmpeg.load({ coreURL: CORE_URL, wasmURL: WASM_URL })
+        await ffmpeg.load({ coreURL, wasmURL })
       } catch (e) {
         ffmpegPromise = null
         throw new Error(
-          `Falha ao carregar ffmpeg.wasm (${e instanceof Error ? e.message : String(e)}). Verifique se /ffmpeg/ffmpeg-core.js está acessível.`,
+          `Falha ao carregar ffmpeg.wasm (${e instanceof Error ? e.message : String(e)}).`,
         )
       }
       return ffmpeg

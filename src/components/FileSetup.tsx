@@ -121,9 +121,8 @@ export default function FileSetup({ onReady }: Props) {
       )
     } catch (e) {
       console.error('audio extraction failed', e)
-      setError(
-        'Falha ao extrair o áudio do vídeo. Em aparelhos com pouca memória, tente um arquivo menor; em desktops, verifique o console.',
-      )
+      const detail = e instanceof Error ? e.message : String(e)
+      setError(`Falha ao extrair o áudio: ${detail}`)
       return null
     }
 

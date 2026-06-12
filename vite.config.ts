@@ -6,18 +6,19 @@ export default defineConfig({
   base: './',
   plugins: [
     react(),
-    // ffmpeg.wasm's UMD core has to be loaded via importScripts inside its
-    // own Web Worker. The package's exports map blocks deep imports of the
-    // dist files, so we copy them to dist/ffmpeg/ at build time (and serve
-    // them from /ffmpeg/ in dev) and reference them by absolute path.
+    // ffmpeg.wasm's internal worker is module-type. importScripts() throws
+    // in module workers, so it falls back to `await import(coreURL)` — which
+    // requires the ESM build (`export default createFFmpegCore`). The UMD
+    // file we shipped before can't be ESM-imported and failed silently with
+    // ERROR_IMPORT_FAILURE. Copy the ESM JS + matching wasm to /ffmpeg/.
     viteStaticCopy({
       targets: [
         {
-          src: 'node_modules/@ffmpeg/core/dist/umd/ffmpeg-core.js',
+          src: 'node_modules/@ffmpeg/core/dist/esm/ffmpeg-core.js',
           dest: 'ffmpeg',
         },
         {
-          src: 'node_modules/@ffmpeg/core/dist/umd/ffmpeg-core.wasm',
+          src: 'node_modules/@ffmpeg/core/dist/esm/ffmpeg-core.wasm',
           dest: 'ffmpeg',
         },
       ],

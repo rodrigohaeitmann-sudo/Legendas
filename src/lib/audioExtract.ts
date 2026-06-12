@@ -27,7 +27,20 @@ async function getFfmpeg() {
     ffmpegPromise = (async () => {
       const { FFmpeg } = await import('@ffmpeg/ffmpeg')
       const ffmpeg = new FFmpeg()
-      await ffmpeg.load({ coreURL: CORE_URL, wasmURL: WASM_URL })
+      // Forward ffmpeg's own log/stderr so a real failure (e.g. an unknown
+      // codec) shows up in the console instead of just our generic "exec
+      // returned non-zero" error.
+      ffmpeg.on('log', ({ message }) => {
+        if (message) console.debug('[ffmpeg]', message)
+      })
+      try {
+        await ffmpeg.load({ coreURL: CORE_URL, wasmURL: WASM_URL })
+      } catch (e) {
+        ffmpegPromise = null
+        throw new Error(
+          `Falha ao carregar ffmpeg.wasm (${e instanceof Error ? e.message : String(e)}). Verifique se /ffmpeg/ffmpeg-core.js está acessível.`,
+        )
+      }
       return ffmpeg
     })()
   }

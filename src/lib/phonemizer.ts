@@ -26,23 +26,39 @@ const VOICE: Record<SourceLang, string> = {
 const IN_PATH = '/work/in.txt'
 const OUT_PATH = '/work/out.txt'
 
-// Force every cue to be its own sentence so espeak emits exactly one phoneme
-// line per input line. Without this, espeak runs adjacent cues together when
-// neither ends in . ! or ?.
+// Force every cue to be a single espeak clause. espeak breaks output into
+// one line per clause and treats any of ., , ; : ! ? … — – as a clause
+// separator. If any of those appear inside a cue, the cue produces multiple
+// IPA lines and shifts the index of every following cue. Strip them all and
+// append a single period as the cue terminator.
 function sentenceTerminated(line: string): string {
-  const flat = line.replace(/\s+/g, ' ').trim()
+  let flat = line.replace(/\s+/g, ' ').trim()
   if (!flat) return ''
-  return /[.!?…]$/.test(flat) ? flat : flat + '.'
+  flat = flat.replace(/[.,;:!?…—–]+/g, ' ').replace(/\s+/g, ' ').trim()
+  if (!flat) return ''
+  return flat + '.'
 }
 
 export async function phonemizeLines(lines: string[], lang: SourceLang): Promise<string[]> {
   const voice = VOICE[lang]
   if (!voice) return lines.map(() => '')
 
-  const sanitized = lines.map(sentenceTerminated)
-  // Replace fully-blank cues with a single space so espeak still emits a
-  // (blank) line for them and the output stays index-aligned.
-  const batch = sanitized.map((l) => l || ' ').join('\n')
+  // Drop empty cues from the batch but remember their original indices so
+  // we can write '' back into those slots without disturbing alignment.
+  const indices: number[] = []
+  const inputs: string[] = []
+  for (let i = 0; i < lines.length; i++) {
+    const s = sentenceTerminated(lines[i])
+    if (s) {
+      indices.push(i)
+      inputs.push(s)
+    }
+  }
+
+  const results = new Array<string>(lines.length).fill('')
+  if (inputs.length === 0) return results
+
+  const batch = inputs.join('\n')
 
   const ESpeakNg = (await import('espeak-ng')).default
   const wasmUrl = (await import('espeak-ng/dist/espeak-ng.wasm?url')).default
@@ -65,12 +81,24 @@ export async function phonemizeLines(lines: string[], lang: SourceLang): Promise
   })
 
   const out: string = espeak.FS.readFile(OUT_PATH, { encoding: 'utf8' })
-  const outLines = out.split('\n')
-  // Drop the trailing empty line that espeak always appends.
-  if (outLines.length && outLines[outLines.length - 1] === '') outLines.pop()
-  // Defensive pad/trim against malformed input that produces extra/missing lines.
-  while (outLines.length < lines.length) outLines.push('')
-  return outLines.slice(0, lines.length).map((l) => l.trim())
+  const outLines = out
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0)
+
+  if (outLines.length !== inputs.length) {
+    // The clause-strip in sentenceTerminated should make this impossible, but
+    // if a future espeak version breaks on a new character we want to know
+    // rather than silently scrambling the IPA column.
+    console.warn(
+      `phonemizer: expected ${inputs.length} IPA lines for ${lang}, got ${outLines.length}`,
+    )
+  }
+
+  for (let i = 0; i < indices.length; i++) {
+    results[indices[i]] = outLines[i] ?? ''
+  }
+  return results
 }
 
 export function isIpaSupported(lang: SourceLang): boolean {

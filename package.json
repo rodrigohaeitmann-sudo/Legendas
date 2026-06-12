@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
     "espeak-ng": "^1.0.2",
     "franc-min": "^6.2.0",
     "phonemize": "^1.2.0",

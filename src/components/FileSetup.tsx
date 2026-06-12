@@ -1,9 +1,17 @@
 import { useRef, useState } from 'react'
-import type { LoadedMedia, MergedCue } from '../types'
+import type { Cue, LoadedMedia, MergedCue } from '../types'
 import { parseSubtitles } from '../lib/parseSubtitles'
 import { phonemizeLines } from '../lib/phonemizer'
 import { translateLines, type TranslationProgress } from '../lib/translateCues'
 import { clearSession, saveSession } from '../lib/sessionStore'
+import {
+  extractAudio,
+  transcribeAudio,
+  WHISPER_MODELS,
+  type CcProgress,
+  type TranscribeHandle,
+  type WhisperModel,
+} from '../lib/transcribe'
 import {
   detectLang,
   langLabel,
@@ -15,27 +23,45 @@ interface Props {
   onReady: (media: LoadedMedia) => void
 }
 
+type SubtitleSource = 'srt' | 'audio'
+
+type SetupProgress =
+  | { kind: 'cc'; phase: CcProgress['phase']; pct: number | null }
+  | { kind: 'translate'; p: TranslationProgress }
+
 const EMAIL_KEY = 'legendas:mymemoryEmail'
 const LANG_KEY = 'legendas:lastSourceLang'
+const WHISPER_KEY = 'legendas:whisperModel'
 
 function loadLastLang(): SourceLang {
   const stored = localStorage.getItem(LANG_KEY) as SourceLang | null
   return SUPPORTED_LANGS.some((l) => l.code === stored) ? (stored as SourceLang) : 'en'
 }
 
+function loadWhisperModel(): WhisperModel {
+  const stored = localStorage.getItem(WHISPER_KEY) as WhisperModel | null
+  return WHISPER_MODELS.some((m) => m.id === stored) ? (stored as WhisperModel) : 'base'
+}
+
 export default function FileSetup({ onReady }: Props) {
+  const [subSource, setSubSource] = useState<SubtitleSource>('srt')
   const [videoFile, setVideoFile] = useState<File | null>(null)
   const [srtFile, setSrtFile] = useState<File | null>(null)
   const [srtText, setSrtText] = useState('')
   const [sourceLang, setSourceLang] = useState<SourceLang>(loadLastLang)
   const [detectedLang, setDetectedLang] = useState<SourceLang | null>(null)
+  const [whisperModel, setWhisperModel] = useState<WhisperModel>(loadWhisperModel)
   const [email, setEmail] = useState(() => localStorage.getItem(EMAIL_KEY) ?? '')
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [error, setError] = useState('')
-  const [progress, setProgress] = useState<TranslationProgress | null>(null)
+  const [progress, setProgress] = useState<SetupProgress | null>(null)
   const abortRef = useRef<AbortController | null>(null)
+  const transcribeRef = useRef<TranscribeHandle | null>(null)
 
-  const canStart = videoFile !== null && srtFile !== null && progress === null
+  const canStart =
+    videoFile !== null &&
+    (subSource === 'srt' ? srtFile !== null : true) &&
+    progress === null
 
   function updateEmail(value: string) {
     setEmail(value)
@@ -47,6 +73,11 @@ export default function FileSetup({ onReady }: Props) {
   function updateSourceLang(value: SourceLang) {
     setSourceLang(value)
     localStorage.setItem(LANG_KEY, value)
+  }
+
+  function updateWhisperModel(value: WhisperModel) {
+    setWhisperModel(value)
+    localStorage.setItem(WHISPER_KEY, value)
   }
 
   async function pickSrt(file: File | null) {
@@ -70,32 +101,75 @@ export default function FileSetup({ onReady }: Props) {
     }
   }
 
+  async function getSourceCues(): Promise<Cue[] | null> {
+    if (subSource === 'srt') {
+      if (!srtText) return null
+      const cues = parseSubtitles(srtText)
+      if (cues.length === 0) {
+        setError('Não encontrei legendas no arquivo. Verifique o formato (.srt/.vtt).')
+        return null
+      }
+      return cues
+    }
+
+    // CC mode: decode the video's audio track and transcribe it locally.
+    setProgress({ kind: 'cc', phase: 'decode', pct: null })
+    let audio: Float32Array
+    try {
+      audio = await extractAudio(videoFile!)
+    } catch {
+      setError(
+        'Não consegui extrair o áudio deste vídeo. Em aparelhos com pouca memória, tente um arquivo menor.',
+      )
+      return null
+    }
+
+    const handle = transcribeAudio(audio, sourceLang, whisperModel, (p) =>
+      setProgress({ kind: 'cc', phase: p.phase, pct: p.pct }),
+    )
+    transcribeRef.current = handle
+    try {
+      const cues = await handle.promise
+      if (cues.length === 0) {
+        setError('A transcrição não encontrou falas no áudio.')
+        return null
+      }
+      return cues
+    } catch {
+      setError('Falha na transcrição. Verifique a conexão (o modelo é baixado na primeira vez).')
+      return null
+    } finally {
+      transcribeRef.current = null
+    }
+  }
+
   async function handleStart() {
-    if (!videoFile || !srtFile || !srtText) return
+    if (!videoFile) return
     setError('')
 
     const controller = new AbortController()
     abortRef.current = controller
     try {
-      const srcCues = parseSubtitles(srtText)
-      if (srcCues.length === 0) {
-        setError('Não encontrei legendas no arquivo. Verifique o formato (.srt/.vtt).')
+      const srcCues = await getSourceCues()
+      if (!srcCues) {
+        setProgress(null)
         return
       }
+      if (controller.signal.aborted) return
 
-      setProgress({ done: 0, total: srcCues.length, failed: 0, provider: null })
+      setProgress({
+        kind: 'translate',
+        p: { done: 0, total: srcCues.length, failed: 0, provider: null },
+      })
 
       const srcTexts = srcCues.map((c) => c.text)
 
-      // espeak-ng runs in a single batched call, so we just await it alongside
-      // the translation pipeline. The wasm download dominates on first run; on
-      // subsequent runs the browser serves it from cache.
       const ipaPromise = phonemizeLines(srcTexts, sourceLang).catch(() =>
         srcTexts.map(() => ''),
       )
       const ptPromise = translateLines(srcTexts, {
         signal: controller.signal,
-        onProgress: setProgress,
+        onProgress: (p) => setProgress({ kind: 'translate', p }),
         email: email.trim() || undefined,
         source: sourceLang,
       })
@@ -126,24 +200,26 @@ export default function FileSetup({ onReady }: Props) {
   }
 
   function handleCancel() {
+    transcribeRef.current?.cancel()
+    transcribeRef.current = null
     abortRef.current?.abort()
     abortRef.current = null
     setProgress(null)
   }
 
   const detectionHint =
-    detectedLang === null
-      ? null
-      : detectedLang === sourceLang
+    subSource === 'srt' && detectedLang !== null
+      ? detectedLang === sourceLang
         ? `Detectado automaticamente: ${langLabel(detectedLang)}.`
         : `Detectado: ${langLabel(detectedLang)}.`
+      : null
 
   return (
     <div className="setup">
       <h1>Treino de Listening</h1>
       <p className="setup-hint">
-        Escolha o vídeo e a legenda. A tradução em português e a transcrição fonética (IPA) com
-        fala conectada são geradas automaticamente.
+        Use um arquivo de legenda, ou gere closed captions direto do áudio do vídeo — útil
+        quando as legendas disponíveis resumem as falas em vez de transcrevê-las.
       </p>
 
       <label className="file-field">
@@ -156,18 +232,56 @@ export default function FileSetup({ onReady }: Props) {
         {videoFile && <small>{videoFile.name}</small>}
       </label>
 
-      <label className="file-field">
-        <span>Legenda (.srt / .vtt)</span>
-        <input
-          type="file"
-          accept=".srt,.vtt"
-          onChange={(e) => pickSrt(e.target.files?.[0] ?? null)}
-        />
-        {srtFile && <small>{srtFile.name}</small>}
-      </label>
+      <div className="source-tabs">
+        <button
+          type="button"
+          className={`source-tab ${subSource === 'srt' ? 'active' : ''}`}
+          onClick={() => setSubSource('srt')}
+        >
+          Arquivo de legenda
+        </button>
+        <button
+          type="button"
+          className={`source-tab ${subSource === 'audio' ? 'active' : ''}`}
+          onClick={() => setSubSource('audio')}
+        >
+          Gerar do áudio (CC)
+        </button>
+      </div>
+
+      {subSource === 'srt' ? (
+        <label className="file-field">
+          <span>Legenda (.srt / .vtt)</span>
+          <input
+            type="file"
+            accept=".srt,.vtt"
+            onChange={(e) => pickSrt(e.target.files?.[0] ?? null)}
+          />
+          {srtFile && <small>{srtFile.name}</small>}
+        </label>
+      ) : (
+        <label className="file-field">
+          <span>Qualidade da transcrição</span>
+          <select
+            value={whisperModel}
+            onChange={(e) => updateWhisperModel(e.target.value as WhisperModel)}
+          >
+            {WHISPER_MODELS.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.label}
+              </option>
+            ))}
+          </select>
+          <small>
+            A transcrição roda no seu aparelho (nada é enviado). O modelo é baixado uma única
+            vez. Em celulares, prefira "Rápido" — mesmo assim pode levar vários minutos por
+            episódio.
+          </small>
+        </label>
+      )}
 
       <label className="file-field">
-        <span>Idioma da legenda</span>
+        <span>{subSource === 'srt' ? 'Idioma da legenda' : 'Idioma do áudio'}</span>
         <select
           value={sourceLang}
           onChange={(e) => updateSourceLang(e.target.value as SourceLang)}
@@ -218,27 +332,54 @@ export default function FileSetup({ onReady }: Props) {
   )
 }
 
+const CC_TITLES: Record<CcProgress['phase'], string> = {
+  decode: 'Extraindo áudio…',
+  model: 'Baixando modelo de transcrição…',
+  transcribe: 'Transcrevendo áudio…',
+}
+
 function ProgressOverlay({
   progress,
   onCancel,
 }: {
-  progress: TranslationProgress
+  progress: SetupProgress
   onCancel: () => void
 }) {
-  const pct = progress.total > 0 ? Math.round((progress.done / progress.total) * 100) : 0
-  const providerLabel =
-    progress.provider === 'google' ? 'Google' : progress.provider === 'mymemory' ? 'MyMemory' : null
+  let title: string
+  let detail: string
+  let pct: number | null
+
+  if (progress.kind === 'cc') {
+    title = CC_TITLES[progress.phase]
+    pct = progress.pct
+    detail =
+      progress.phase === 'transcribe'
+        ? `${Math.round(pct ?? 0)}% — pode demorar, mantenha o app aberto`
+        : pct !== null
+          ? `${Math.round(pct)}%`
+          : ''
+  } else {
+    const p = progress.p
+    title = 'Traduzindo legenda…'
+    pct = p.total > 0 ? (p.done / p.total) * 100 : 0
+    const providerLabel =
+      p.provider === 'google' ? 'Google' : p.provider === 'mymemory' ? 'MyMemory' : null
+    detail =
+      `${p.done}/${p.total} linhas` +
+      (p.failed > 0 ? ` · ${p.failed} falharam` : '') +
+      (providerLabel ? ` · via ${providerLabel}` : '')
+  }
+
   return (
     <div className="progress-backdrop">
       <div className="progress-card">
-        <h2>Traduzindo legenda…</h2>
-        <p className="progress-count">
-          {progress.done}/{progress.total} linhas
-          {progress.failed > 0 && ` · ${progress.failed} falharam`}
-          {providerLabel && ` · via ${providerLabel}`}
-        </p>
-        <div className="progress-bar">
-          <div className="progress-bar-fill" style={{ width: `${pct}%` }} />
+        <h2>{title}</h2>
+        {detail && <p className="progress-count">{detail}</p>}
+        <div className={`progress-bar ${pct === null ? 'indeterminate' : ''}`}>
+          <div
+            className="progress-bar-fill"
+            style={pct !== null ? { width: `${Math.round(pct)}%` } : undefined}
+          />
         </div>
         <button className="progress-cancel" onClick={onCancel}>
           Cancelar

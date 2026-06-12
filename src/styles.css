@@ -576,3 +576,17 @@ button {
   padding: 9px 10px;
   font-size: 14px;
 }
+
+.progress-bar.indeterminate .progress-bar-fill {
+  width: 35%;
+  animation: indeterminate 1.2s ease-in-out infinite;
+}
+
+@keyframes indeterminate {
+  0% {
+    margin-left: -35%;
+  }
+  100% {
+    margin-left: 100%;
+  }
+}

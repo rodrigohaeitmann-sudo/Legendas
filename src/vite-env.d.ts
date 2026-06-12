@@ -22,3 +22,4 @@ declare module 'espeak-ng/dist/espeak-ng.wasm?url' {
   const url: string
   export default url
 }
+

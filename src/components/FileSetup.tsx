@@ -116,10 +116,13 @@ export default function FileSetup({ onReady }: Props) {
     setProgress({ kind: 'cc', phase: 'decode', pct: null })
     let audio: Float32Array
     try {
-      audio = await extractAudio(videoFile!)
-    } catch {
+      audio = await extractAudio(videoFile!, (ratio) =>
+        setProgress({ kind: 'cc', phase: 'decode', pct: ratio === null ? null : ratio * 100 }),
+      )
+    } catch (e) {
+      console.error('audio extraction failed', e)
       setError(
-        'Não consegui extrair o áudio deste vídeo. Em aparelhos com pouca memória, tente um arquivo menor.',
+        'Falha ao extrair o áudio do vídeo. Em aparelhos com pouca memória, tente um arquivo menor; em desktops, verifique o console.',
       )
       return null
     }

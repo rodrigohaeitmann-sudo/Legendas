@@ -9,6 +9,7 @@
 
 import type { Cue } from '../types'
 import type { SourceLang } from './detectLang'
+import { extractAudioPcm } from './audioExtract'
 
 export type WhisperModel = 'tiny' | 'base' | 'small'
 
@@ -31,16 +32,11 @@ const WINDOW_S = 300
 // How far around the nominal window edge we search for the quietest moment.
 const EDGE_SEARCH_S = 5
 
-export async function extractAudio(file: File): Promise<Float32Array> {
-  const buf = await file.arrayBuffer()
-  const ctx = new OfflineAudioContext({ numberOfChannels: 1, length: 1, sampleRate: SAMPLE_RATE })
-  const decoded = await ctx.decodeAudioData(buf)
-  const mono = new Float32Array(decoded.length)
-  for (let ch = 0; ch < decoded.numberOfChannels; ch++) {
-    const data = decoded.getChannelData(ch)
-    for (let i = 0; i < mono.length; i++) mono[i] += data[i] / decoded.numberOfChannels
-  }
-  return mono
+export async function extractAudio(
+  file: File,
+  onProgress: (ratio: number | null) => void,
+): Promise<Float32Array> {
+  return extractAudioPcm(file, (p) => onProgress(p.ratio))
 }
 
 // Find the quietest 100ms frame within [center - radius, center + radius] so

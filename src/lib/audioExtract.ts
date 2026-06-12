@@ -83,9 +83,22 @@ export async function extractAudioPcm(
 
   try {
     onProgress({ ratio: null })
+
+    // emscripten's FS requires the mount point to exist as a directory
+    // before mount(); skipping this is what produced the bare "ErrnoError:
+    // FS error" the user saw. createDir throws if the dir already exists
+    // from a previous run in this same ffmpeg instance — swallow that.
+    try {
+      await ffmpeg.createDir(MOUNT_DIR)
+    } catch { /* already exists */ }
+
     // WORKERFS keeps the File backed by the browser's File handle. We only
     // pay RAM for the (much smaller) output PCM, not for the source video.
-    await ffmpeg.mount(FFFSType.WORKERFS, { files: [file] }, MOUNT_DIR)
+    try {
+      await ffmpeg.mount(FFFSType.WORKERFS, { files: [file] }, MOUNT_DIR)
+    } catch (e) {
+      throw new Error(`mount falhou: ${describeError(e)}`)
+    }
     const inputPath = `${MOUNT_DIR}/${file.name}`
 
     // -vn: ignore video. -map 0:a:0: take the first audio track (Brazilian
@@ -94,16 +107,21 @@ export async function extractAudioPcm(
     // -ac 1 -ar 16000: mono at Whisper's required sample rate.
     // -f f32le: write raw little-endian 32-bit float PCM, no container, so
     // we can reinterpret the bytes as Float32Array with zero parsing.
-    const rc = await ffmpeg.exec([
-      '-i', inputPath,
-      '-vn',
-      '-map', '0:a:0',
-      '-ac', '1',
-      '-ar', String(SAMPLE_RATE),
-      '-f', 'f32le',
-      OUT_PATH,
-    ])
-    if (rc !== 0) throw new Error(`ffmpeg exit ${rc}`)
+    let rc: number
+    try {
+      rc = await ffmpeg.exec([
+        '-i', inputPath,
+        '-vn',
+        '-map', '0:a:0',
+        '-ac', '1',
+        '-ar', String(SAMPLE_RATE),
+        '-f', 'f32le',
+        OUT_PATH,
+      ])
+    } catch (e) {
+      throw new Error(`exec falhou: ${describeError(e)}`)
+    }
+    if (rc !== 0) throw new Error(`ffmpeg exit ${rc} (veja o console)`)
 
     const data = await ffmpeg.readFile(OUT_PATH)
     const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : data
@@ -121,4 +139,19 @@ export async function extractAudioPcm(
   } finally {
     ffmpeg.off('progress', progressListener)
   }
+}
+
+// emscripten ErrnoError's .message is just "FS error". The actual cause
+// lives in .errno and .code — surface them so the next failure is debuggable.
+function describeError(e: unknown): string {
+  if (e && typeof e === 'object') {
+    const obj = e as { message?: unknown; errno?: unknown; code?: unknown; name?: unknown }
+    const parts: string[] = []
+    if (obj.name) parts.push(String(obj.name))
+    if (obj.message) parts.push(String(obj.message))
+    if (obj.code) parts.push(`code=${String(obj.code)}`)
+    if (obj.errno !== undefined) parts.push(`errno=${String(obj.errno)}`)
+    if (parts.length) return parts.join(' · ')
+  }
+  return String(e)
 }

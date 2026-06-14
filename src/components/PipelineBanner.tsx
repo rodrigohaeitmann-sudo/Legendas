@@ -9,6 +9,13 @@ const PROVIDER_LABEL: Record<string, string> = {
   mymemory: 'MyMemory',
 }
 
+const CC_STEP_LABEL: Record<'probe' | 'model' | 'extract' | 'transcribe', string> = {
+  probe: 'Lendo metadados',
+  model: 'Baixando modelo',
+  extract: 'Extraindo áudio',
+  transcribe: 'Transcrevendo',
+}
+
 // Small non-blocking status bar under the video so the user knows the
 // background work is still going. Hidden completely once the build is done
 // (or before it starts) so the UI stays clean.
@@ -18,18 +25,30 @@ export default function PipelineBanner({ phase }: Props) {
   let tone: 'progress' | 'error' = 'progress'
 
   switch (phase.kind) {
-    case 'extract':
-      label = 'Extraindo áudio'
-      pct = phase.pct
+    case 'cc': {
+      // Overall progress: chunkIndex completed out of totalChunks. Within
+      // the current chunk, the step label tells what's happening; the bar
+      // advances when the chunk completes.
+      const step = CC_STEP_LABEL[phase.step]
+      label =
+        phase.totalChunks > 0
+          ? `${step} · trecho ${phase.chunkIndex + 1}/${phase.totalChunks}`
+          : step
+      if (phase.totalChunks > 0) {
+        // Smoothly blend chunk progress: extract = 0..50% of slot,
+        // transcribe = 50..100% of slot. Probe/model don't move the bar.
+        const slotPct =
+          phase.step === 'extract'
+            ? Math.min(50, ((phase.pct ?? 0) / 100) * 50)
+            : phase.step === 'transcribe'
+              ? 50
+              : 0
+        pct = ((phase.chunkIndex + slotPct / 100) / phase.totalChunks) * 100
+      } else {
+        pct = phase.pct
+      }
       break
-    case 'model':
-      label = 'Baixando modelo de transcrição'
-      pct = phase.pct
-      break
-    case 'transcribe':
-      label = `Transcrevendo · ${phase.windowsDone}/${phase.totalWindows} janelas`
-      pct = phase.pct
-      break
+    }
     case 'translate': {
       const provider = phase.provider ? ` · ${PROVIDER_LABEL[phase.provider] ?? phase.provider}` : ''
       const failed = phase.failed > 0 ? ` · ${phase.failed} falharam` : ''

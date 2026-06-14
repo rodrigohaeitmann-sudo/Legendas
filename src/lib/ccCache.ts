@@ -1,7 +1,8 @@
-// Persists in-flight CC progress to IndexedDB so a backgrounded tab — or
-// a phone the user came back to half an hour later — picks up where it
-// left off instead of starting from zero. The cache holds the extracted
-// audio plus per-window cues so both phases are resumable.
+// Persists in-flight CC progress to IndexedDB so a backgrounded tab or a
+// phone the user came back to half an hour later picks up where it left
+// off. Only the cues + chunk pointer are cached — audio re-extraction is
+// fast enough per chunk (with input-level seek) that caching the entire
+// PCM buffer was wasteful.
 
 import type { Cue } from '../types'
 import type { SourceLang } from './detectLang'
@@ -9,17 +10,17 @@ import type { WhisperModel } from './transcribe'
 
 const DB_NAME = 'legendas-cc'
 const STORE = 'progress'
-// Single-row layout: we only ever cache the most recent video. The keyPath
-// is videoId so opening a different video naturally invalidates the entry.
 const DB_VERSION = 1
 
 export interface CcEntry {
   videoId: string
   lang: SourceLang
   model: WhisperModel
-  audio?: Float32Array
   cues: Cue[]
-  windowIndex: number
+  /** Number of chunks already extracted+transcribed (next chunk to do = this). */
+  chunkIndex: number
+  /** Total duration in seconds, cached so resume skips the ffprobe. */
+  duration?: number
   updatedAt: number
 }
 
@@ -30,7 +31,10 @@ function openDb(): Promise<IDBDatabase> {
     dbPromise = new Promise((resolve, reject) => {
       const req = indexedDB.open(DB_NAME, DB_VERSION)
       req.onupgradeneeded = () => {
-        req.result.createObjectStore(STORE, { keyPath: 'videoId' })
+        const db = req.result
+        if (!db.objectStoreNames.contains(STORE)) {
+          db.createObjectStore(STORE, { keyPath: 'videoId' })
+        }
       }
       req.onsuccess = () => resolve(req.result)
       req.onerror = () => reject(req.error)
@@ -51,8 +55,6 @@ export async function loadCcProgress(
       const req = tx.objectStore(STORE).get(videoId)
       req.onsuccess = () => {
         const e = req.result as CcEntry | undefined
-        // Reusing an entry from a different lang/model would mis-pair cues
-        // (different transcript) and confuse Whisper's resume index.
         if (!e || e.lang !== lang || e.model !== model) return resolve(null)
         resolve(e)
       }
@@ -63,8 +65,6 @@ export async function loadCcProgress(
   }
 }
 
-// Replace previous-video entries so we never accumulate audio buffers
-// (each is tens of MB) past the one in progress.
 async function clearOthers(db: IDBDatabase, keepVideoId: string): Promise<void> {
   await new Promise<void>((resolve) => {
     const tx = db.transaction(STORE, 'readwrite')

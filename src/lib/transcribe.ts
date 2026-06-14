@@ -1,15 +1,10 @@
-// In-browser speech-to-text via Whisper (transformers.js), used to generate
-// CC-style cues straight from the video's audio track when no faithful
-// subtitle file exists (common for French, where most subs are simplified).
-//
-// Heavy work happens in a Web Worker (see transcribeWorker.ts). This module
-// owns the browser-only part: decoding the MP4's audio to 16 kHz mono PCM,
-// splitting it into windows at low-energy (silence-ish) points, and relaying
-// progress.
+// Thin wrapper around the Whisper worker (transcribeWorker.ts). The worker
+// caches the model after first load — by keeping the same worker alive
+// across chunks, the pipeline avoids the multi-second model warmup that
+// would otherwise hit on every chunk.
 
 import type { Cue } from '../types'
 import type { SourceLang } from './detectLang'
-import { extractAudioPcm } from './audioExtract'
 
 export type WhisperModel = 'tiny' | 'base' | 'small'
 
@@ -19,160 +14,78 @@ export const WHISPER_MODELS: ReadonlyArray<{ id: WhisperModel; label: string }> 
   { id: 'small', label: 'Preciso (~250 MB, lento)' },
 ]
 
-export interface CcProgress {
-  phase: 'decode' | 'model' | 'transcribe'
+export interface ModelProgress {
   pct: number | null
 }
 
-const SAMPLE_RATE = 16000
-// Each worker call covers ~5 min of audio: long enough that whisper's own
-// internal 30s chunking + stride does the stitching, short enough to give
-// real progress updates and cancellation points between calls.
-const WINDOW_S = 300
-// How far around the nominal window edge we search for the quietest moment.
-const EDGE_SEARCH_S = 5
-
-export async function extractAudio(
-  file: File,
-  onProgress: (ratio: number | null) => void,
-): Promise<Float32Array> {
-  return extractAudioPcm(file, (p) => onProgress(p.ratio))
+type Pending = {
+  resolve: (cues: Cue[]) => void
+  reject: (e: Error) => void
 }
 
-// Find the quietest 100ms frame within [center - radius, center + radius] so
-// window boundaries fall in pauses instead of mid-word.
-function quietestSplit(audio: Float32Array, center: number, radius: number): number {
-  const frame = Math.floor(SAMPLE_RATE * 0.1)
-  const from = Math.max(0, center - radius)
-  const to = Math.min(audio.length - frame, center + radius)
-  let best = center
-  let bestEnergy = Infinity
-  for (let i = from; i <= to; i += frame) {
-    let e = 0
-    for (let j = i; j < i + frame; j++) e += audio[j] * audio[j]
-    if (e < bestEnergy) {
-      bestEnergy = e
-      best = i
-    }
-  }
-  return best
-}
+export class WhisperPool {
+  private worker: Worker
+  private pending: Pending | null = null
+  private onModelProgress: (p: ModelProgress) => void
+  private terminated = false
 
-// Window boundaries as sample indices; slices are materialized lazily, one at
-// a time, so peak memory stays at master + current window.
-function splitBoundaries(audio: Float32Array): number[] {
-  const bounds: number[] = [0]
-  const radius = SAMPLE_RATE * EDGE_SEARCH_S
-  let start = 0
-  while (start < audio.length) {
-    const nominalEnd = start + WINDOW_S * SAMPLE_RATE
-    const end =
-      nominalEnd >= audio.length ? audio.length : quietestSplit(audio, nominalEnd, radius)
-    bounds.push(end)
-    start = end
-  }
-  return bounds
-}
-
-export interface TranscribeHandle {
-  promise: Promise<Cue[]>
-  cancel: () => void
-}
-
-export interface TranscribeOptions {
-  /** Cues already produced (from a previous interrupted run). */
-  resumeCues?: Cue[]
-  /** Number of windows already done; transcription resumes from this index. */
-  resumeWindowIndex?: number
-  /** Called after each window completes — caller persists for resume. */
-  onWindowDone?: (cues: Cue[], windowIndex: number, totalWindows: number) => void
-}
-
-export function transcribeAudio(
-  audio: Float32Array,
-  lang: SourceLang,
-  model: WhisperModel,
-  onProgress: (p: CcProgress) => void,
-  opts: TranscribeOptions = {},
-): TranscribeHandle {
-  const worker = new Worker(new URL('./transcribeWorker.ts', import.meta.url), {
-    type: 'module',
-  })
-
-  const bounds = splitBoundaries(audio)
-  const windowCount = bounds.length - 1
-  const totalSamples = audio.length
-  let cancelled = false
-
-  const promise = new Promise<Cue[]>((resolve, reject) => {
-    const cues: Cue[] = opts.resumeCues ? [...opts.resumeCues] : []
-    let windowIndex = Math.min(opts.resumeWindowIndex ?? 0, windowCount)
-
-    function reportTranscribeProgress() {
-      const doneSamples = bounds[windowIndex]
-      // No 99% cap: when every window is done we want the bar to actually
-      // reach 100% and then transition; the visual stall the user saw was
-      // partly from never crossing that threshold.
-      onProgress({
-        phase: 'transcribe',
-        pct: totalSamples ? (doneSamples / totalSamples) * 100 : 100,
-      })
-    }
-
-    function sendNext() {
-      if (cancelled) return
-      if (windowIndex >= windowCount) {
-        reportTranscribeProgress()
-        worker.terminate()
-        resolve(cues)
-        return
-      }
-      const from = bounds[windowIndex]
-      const to = bounds[windowIndex + 1]
-      const samples = audio.slice(from, to)
-      worker.postMessage(
-        { type: 'transcribe', audio: samples, offset: from / SAMPLE_RATE, lang, model },
-        [samples.buffer],
-      )
-    }
-
-    worker.onmessage = (e: MessageEvent) => {
+  constructor(onModelProgress: (p: ModelProgress) => void) {
+    this.onModelProgress = onModelProgress
+    this.worker = new Worker(new URL('./transcribeWorker.ts', import.meta.url), {
+      type: 'module',
+    })
+    this.worker.onmessage = (e: MessageEvent) => {
       const msg = e.data
       if (msg.type === 'model-progress') {
-        onProgress({ phase: 'model', pct: msg.pct })
+        this.onModelProgress({ pct: msg.pct })
       } else if (msg.type === 'window-done') {
-        for (const c of msg.cues as Cue[]) cues.push(c)
-        windowIndex++
-        reportTranscribeProgress()
-        opts.onWindowDone?.(cues, windowIndex, windowCount)
-        sendNext()
+        const p = this.pending
+        this.pending = null
+        p?.resolve(msg.cues as Cue[])
       } else if (msg.type === 'error') {
-        worker.terminate()
-        reject(new Error(msg.message))
+        const p = this.pending
+        this.pending = null
+        p?.reject(new Error(msg.message))
       }
     }
-    worker.onerror = (e) => {
-      worker.terminate()
-      reject(new Error(e.message || 'worker error'))
+    this.worker.onerror = (e: ErrorEvent) => {
+      const p = this.pending
+      this.pending = null
+      p?.reject(new Error(e.message || 'worker error'))
     }
+  }
 
-    if (windowIndex >= windowCount) {
-      // Everything's already cached from a previous run.
-      reportTranscribeProgress()
-      worker.terminate()
-      resolve(cues)
-      return
+  // Transcribes one audio chunk. `offsetSec` is added to the cue
+  // timestamps so they're absolute against the full video timeline.
+  transcribe(
+    audio: Float32Array,
+    offsetSec: number,
+    lang: SourceLang,
+    model: WhisperModel,
+  ): Promise<Cue[]> {
+    return new Promise<Cue[]>((resolve, reject) => {
+      if (this.terminated) {
+        reject(new Error('pool terminated'))
+        return
+      }
+      if (this.pending) {
+        reject(new Error('pool busy'))
+        return
+      }
+      this.pending = { resolve, reject }
+      this.worker.postMessage(
+        { type: 'transcribe', audio, offset: offsetSec, lang, model },
+        [audio.buffer],
+      )
+    })
+  }
+
+  terminate() {
+    this.terminated = true
+    this.worker.terminate()
+    if (this.pending) {
+      this.pending.reject(new Error('terminated'))
+      this.pending = null
     }
-
-    onProgress({ phase: 'model', pct: null })
-    sendNext()
-  })
-
-  return {
-    promise,
-    cancel: () => {
-      cancelled = true
-      worker.terminate()
-    },
   }
 }

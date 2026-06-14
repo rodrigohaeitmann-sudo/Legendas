@@ -2,20 +2,15 @@
 // playback is already running. Two source modes:
 //
 // - SRT: cues are known instantly; PT/IPA stream in next to playback.
-// - CC:  audio extract + Whisper run in the background, each window
-//        appends new cues, which then get translated/phonemized.
-//
-// The pipeline owns no React state — it just exposes callbacks the caller
-// (App) wires into setState. Cancel terminates every in-flight worker.
+// - CC:  chunk-by-chunk extract + Whisper. Each chunk (~3 min of audio)
+//        is decoded with ffmpeg's input-level seek, fed to Whisper, then
+//        annotated. The first cues land in ~1-2 min instead of waiting
+//        for the entire file to be decoded.
 
 import type { Cue, MergedCue } from '../types'
 import type { SourceLang } from './detectLang'
-import {
-  extractAudio,
-  transcribeAudio,
-  type CcProgress,
-  type WhisperModel,
-} from './transcribe'
+import { extractAudioRange, probeDuration } from './audioExtract'
+import { WhisperPool, type WhisperModel } from './transcribe'
 import { parseSubtitles } from './parseSubtitles'
 import { phonemizeLines } from './phonemizer'
 import { translateLines, type ProviderId } from './translateCues'
@@ -24,6 +19,11 @@ import {
   loadCcProgress,
   saveCcProgress,
 } from './ccCache'
+
+const CHUNK_SECONDS = 180 // 3 min — short enough that the first cues
+                          // appear quickly, long enough that Whisper's
+                          // internal 30s context still lands inside one
+                          // chunk most of the time.
 
 export type SubtitleSource =
   | { kind: 'srt'; text: string }
@@ -39,13 +39,12 @@ export interface PipelineConfig {
 
 export type PipelinePhase =
   | { kind: 'idle' }
-  | { kind: 'extract'; pct: number | null }
-  | { kind: 'model'; pct: number | null }
   | {
-      kind: 'transcribe'
-      pct: number
-      windowsDone: number
-      totalWindows: number
+      kind: 'cc'
+      step: 'probe' | 'model' | 'extract' | 'transcribe'
+      chunkIndex: number
+      totalChunks: number
+      pct: number | null
     }
   | {
       kind: 'translate'
@@ -58,11 +57,8 @@ export type PipelinePhase =
   | { kind: 'error'; message: string }
 
 export interface PipelineCallbacks {
-  /** Replace the whole cue list (used when SRT is parsed up front). */
   onCuesReplaced: (cues: MergedCue[]) => void
-  /** Append new cues (CC mode: each Whisper window emits a batch). */
   onCuesAppended: (newCues: MergedCue[]) => void
-  /** Patch a single cue in place (PT and IPA stream in after creation). */
   onCueUpdated: (index: number, patch: Partial<MergedCue>) => void
   onPhase: (phase: PipelinePhase) => void
 }
@@ -80,10 +76,6 @@ export function startPipeline(
   cb: PipelineCallbacks,
 ): PipelineHandle {
   const controller = new AbortController()
-  // Tracks the offset for index-aligned updates from translate/phonemize.
-  // When new cues are appended (CC mode) we know they live at
-  // [totalCount, totalCount + N), and any update by *local* index maps to
-  // global = base + local.
   let totalCount = 0
   let cancelled = false
 
@@ -92,14 +84,9 @@ export function startPipeline(
     controller.abort()
   }
 
-  // Translate + phonemize a batch of newly-available source cues. Updates
-  // arrive line-by-line so the user sees PT/IPA appear next to the active
-  // cue without waiting for the whole batch.
   async function annotate(sourceTexts: string[], baseIndex: number) {
     if (cancelled || sourceTexts.length === 0) return
 
-    // espeak's batch call is fast (≤1s for hundreds of lines), so we just
-    // run it once over the batch and fan out updates.
     const ipaPromise = phonemizeLines(sourceTexts, config.sourceLang)
       .then((lines) => {
         if (cancelled) return
@@ -119,9 +106,6 @@ export function startPipeline(
       },
       onProgress: (p) => {
         if (cancelled) return
-        // Only relevant when there's no CC streaming in progress. CC mode
-        // re-publishes its own transcribe phase between translate batches,
-        // so this gets overridden naturally.
         cb.onPhase({
           kind: 'translate',
           done: p.done,
@@ -156,98 +140,133 @@ export function startPipeline(
 
     const cached = await loadCcProgress(config.videoId, config.sourceLang, model)
 
-    let audio: Float32Array
-    if (cached?.audio) {
-      audio = cached.audio
+    // 1. Get duration — needed to compute chunk count up front.
+    let duration: number
+    if (cached?.duration && cached.duration > 0) {
+      duration = cached.duration
     } else {
-      cb.onPhase({ kind: 'extract', pct: null })
+      cb.onPhase({ kind: 'cc', step: 'probe', chunkIndex: 0, totalChunks: 0, pct: null })
       try {
-        audio = await extractAudio(config.videoFile, (ratio) => {
-          if (cancelled) return
-          cb.onPhase({ kind: 'extract', pct: ratio === null ? null : ratio * 100 })
-        })
+        duration = await probeDuration(config.videoFile, config.videoId)
       } catch (e) {
         cb.onPhase({
           kind: 'error',
-          message: `Falha ao extrair o áudio: ${e instanceof Error ? e.message : String(e)}`,
+          message: `Falha ao ler o vídeo: ${e instanceof Error ? e.message : String(e)}`,
         })
         return
       }
       if (cancelled) return
-      await saveCcProgress({
-        videoId: config.videoId,
-        lang: config.sourceLang,
-        model,
-        audio,
-        cues: cached?.cues ?? [],
-        windowIndex: cached?.windowIndex ?? 0,
-        updatedAt: Date.now(),
-      })
     }
 
-    // Annotation runs in parallel with transcription, but "done" must wait
-    // for both, otherwise the final cues land in the session store with
-    // missing PT/IPA columns.
+    const totalChunks = Math.max(1, Math.ceil(duration / CHUNK_SECONDS))
+    let chunkIndex = Math.min(cached?.chunkIndex ?? 0, totalChunks)
     const annotateJobs: Array<Promise<unknown>> = []
+    const cuesAccum: Cue[] = [...(cached?.cues ?? [])]
 
-    if (cached?.cues?.length) {
-      const merged = cached.cues.map(toMerged)
+    // Replay anything previously transcribed so the user can watch with
+    // what's already done while we resume.
+    if (cuesAccum.length) {
+      const merged = cuesAccum.map(toMerged)
       cb.onCuesAppended(merged)
       totalCount += merged.length
-      annotateJobs.push(annotate(cached.cues.map((c) => c.text), 0))
+      annotateJobs.push(annotate(cuesAccum.map((c) => c.text), 0))
     }
 
-    const handle = transcribeAudio(audio, config.sourceLang, model, (p: CcProgress) => {
+    const pool = new WhisperPool((p) => {
       if (cancelled) return
-      if (p.phase === 'model') {
-        cb.onPhase({ kind: 'model', pct: p.pct })
-      }
-    }, {
-      resumeCues: cached?.cues,
-      resumeWindowIndex: cached?.windowIndex,
-      onWindowDone: (cues, windowIndex, totalWindows) => {
+      cb.onPhase({
+        kind: 'cc',
+        step: 'model',
+        chunkIndex,
+        totalChunks,
+        pct: p.pct,
+      })
+    })
+
+    try {
+      while (chunkIndex < totalChunks) {
         if (cancelled) return
-        const newSourceCues = cues.slice(totalCount)
-        if (newSourceCues.length > 0) {
-          const base = totalCount
-          const newMerged = newSourceCues.map(toMerged)
-          cb.onCuesAppended(newMerged)
-          totalCount += newMerged.length
-          annotateJobs.push(annotate(newSourceCues.map((c) => c.text), base))
-        }
+        const startSec = chunkIndex * CHUNK_SECONDS
+        const dur = Math.min(CHUNK_SECONDS, duration - startSec)
+        if (dur <= 0) break
+
         cb.onPhase({
-          kind: 'transcribe',
-          pct: (windowIndex / totalWindows) * 100,
-          windowsDone: windowIndex,
-          totalWindows,
+          kind: 'cc',
+          step: 'extract',
+          chunkIndex,
+          totalChunks,
+          pct: 0,
         })
+        let audio: Float32Array
+        try {
+          audio = await extractAudioRange(config.videoFile, config.videoId, startSec, dur, (p) => {
+            if (cancelled) return
+            cb.onPhase({
+              kind: 'cc',
+              step: 'extract',
+              chunkIndex,
+              totalChunks,
+              pct: p.ratio === null ? null : p.ratio * 100,
+            })
+          })
+        } catch (e) {
+          cb.onPhase({
+            kind: 'error',
+            message: `Falha ao extrair áudio do trecho ${chunkIndex + 1}/${totalChunks}: ${e instanceof Error ? e.message : String(e)}`,
+          })
+          return
+        }
+        if (cancelled) return
+        if (audio.length === 0) {
+          // empty range — skip and advance
+          chunkIndex++
+          continue
+        }
+
+        cb.onPhase({
+          kind: 'cc',
+          step: 'transcribe',
+          chunkIndex,
+          totalChunks,
+          pct: null,
+        })
+        let chunkCues: Cue[]
+        try {
+          chunkCues = await pool.transcribe(audio, startSec, config.sourceLang, model)
+        } catch (e) {
+          cb.onPhase({
+            kind: 'error',
+            message: `Falha na transcrição do trecho ${chunkIndex + 1}/${totalChunks}: ${e instanceof Error ? e.message : String(e)}`,
+          })
+          return
+        }
+        if (cancelled) return
+
+        if (chunkCues.length > 0) {
+          const base = totalCount
+          const merged = chunkCues.map(toMerged)
+          cb.onCuesAppended(merged)
+          totalCount += merged.length
+          annotateJobs.push(annotate(chunkCues.map((c) => c.text), base))
+          for (const c of chunkCues) cuesAccum.push(c)
+        }
+
+        chunkIndex++
         void saveCcProgress({
           videoId: config.videoId,
           lang: config.sourceLang,
           model,
-          audio,
-          cues,
-          windowIndex,
+          cues: cuesAccum,
+          chunkIndex,
+          duration,
           updatedAt: Date.now(),
         })
-      },
-    })
-
-    try {
-      await handle.promise
-    } catch (e) {
-      if (!cancelled) {
-        cb.onPhase({
-          kind: 'error',
-          message: `Falha na transcrição: ${e instanceof Error ? e.message : String(e)}`,
-        })
       }
-      return
+    } finally {
+      pool.terminate()
     }
-    if (cancelled) return
 
-    // Wait for every in-flight annotate batch before declaring done — the
-    // session save in App reads media.cues, and we want PT/IPA finalized.
+    if (cancelled) return
     await Promise.allSettled(annotateJobs)
     if (cancelled) return
 

@@ -1,7 +1,13 @@
-import { useEffect, useRef, useState, type CSSProperties } from 'react'
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react'
 import type { LoadedMedia, MergedCue, Settings, Toggles, TrackKey } from './types'
 import { usePlayer } from './hooks/usePlayer'
-import { clearSession, loadSession, saveSession } from './lib/sessionStore'
+import {
+  clearSession,
+  loadSession,
+  saveSession,
+  type SessionResume,
+  type StoredSession,
+} from './lib/sessionStore'
 import {
   startPipeline,
   type PipelineConfig,
@@ -21,6 +27,9 @@ const TOGGLES_KEY = 'legendas.toggles'
 const SETTINGS_KEY = 'legendas.settings'
 const DEFAULT_TOGGLES: Toggles = { ipa: true, en: true, pt: true }
 const DEFAULT_SETTINGS: Settings = { fontScale: 1, fontFamily: 'system', speed: 1 }
+// How often to write the in-progress session to IndexedDB while the
+// pipeline keeps streaming cues in.
+const PARTIAL_SAVE_INTERVAL_MS = 5000
 
 const FONT_STACKS: Record<Settings['fontFamily'], string> = {
   system: "system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif",
@@ -56,10 +65,19 @@ export default function App() {
   const [offset, setOffset] = useState(0)
   const [showSettings, setShowSettings] = useState(false)
   const [phase, setPhase] = useState<PipelinePhase>({ kind: 'idle' })
+
   const pipelineRef = useRef<PipelineHandle | null>(null)
-  // Keep the latest videoBlob aside so we can save the session on Done
-  // without forcing FileSetup to thread it through every callback.
-  const videoBlobRef = useRef<{ id: string; blob: Blob } | null>(null)
+  // Latest media kept in a ref so the periodic save interval doesn't go
+  // stale between state updates.
+  const mediaRef = useRef<LoadedMedia | null>(null)
+  const phaseRef = useRef<PipelinePhase>({ kind: 'idle' })
+  // Holds the videoBlob + pipeline source so the periodic save can
+  // re-emit the full session record without forcing FileSetup to keep
+  // passing the File around.
+  const buildRef = useRef<{ videoBlob: Blob; resume: SessionResume } | null>(null)
+
+  useEffect(() => { mediaRef.current = media }, [media])
+  useEffect(() => { phaseRef.current = phase }, [phase])
 
   useEffect(() => {
     localStorage.setItem(TOGGLES_KEY, JSON.stringify(toggles))
@@ -69,23 +87,101 @@ export default function App() {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings))
   }, [settings])
 
-  // Reopen the last fully-built session automatically.
+  const startBuildInternal = useCallback(
+    (config: PipelineConfig, initialMedia?: LoadedMedia) => {
+      pipelineRef.current?.cancel()
+
+      const videoUrl = initialMedia?.videoUrl ?? URL.createObjectURL(config.videoFile)
+      const opening: LoadedMedia = initialMedia ?? {
+        videoUrl,
+        videoId: config.videoId,
+        cues: [],
+      }
+      setMedia(opening)
+      mediaRef.current = opening
+      setPhase({ kind: 'idle' })
+
+      buildRef.current = {
+        videoBlob: config.videoFile,
+        resume: {
+          sourceLang: config.sourceLang,
+          email: config.email,
+          source: config.source,
+        },
+      }
+
+      // Write an immediate baseline so even a fast reload right after
+      // Start still finds the file + resume info in IDB.
+      void saveSession({
+        videoId: opening.videoId,
+        videoBlob: config.videoFile,
+        cues: opening.cues,
+        resume: buildRef.current.resume,
+      }).catch(() => undefined)
+
+      pipelineRef.current = startPipeline(config, {
+        onCuesReplaced: (next) => {
+          setMedia((m) => (m && m.videoId === config.videoId ? { ...m, cues: next } : m))
+        },
+        onCuesAppended: (newCues) => {
+          setMedia((m) => {
+            if (!m || m.videoId !== config.videoId) return m
+            return { ...m, cues: [...m.cues, ...newCues] }
+          })
+        },
+        onCueUpdated: (i, patch) => {
+          setMedia((m) => {
+            if (!m || m.videoId !== config.videoId) return m
+            if (i < 0 || i >= m.cues.length) return m
+            const nextCues = m.cues.slice()
+            nextCues[i] = { ...nextCues[i], ...patch }
+            return { ...m, cues: nextCues }
+          })
+        },
+        onPhase: setPhase,
+      })
+    },
+    [],
+  )
+
+  // Auto-restore on launch. If the previous session was still building
+  // (has resume info), open the player with the cues we managed to save
+  // and continue the pipeline from where it left off.
   useEffect(() => {
     loadSession()
       .then((session) => {
-        if (session) {
-          setMedia({
-            videoUrl: URL.createObjectURL(session.videoBlob),
+        if (!session) return
+        const videoUrl = URL.createObjectURL(session.videoBlob)
+        const initialMedia: LoadedMedia = {
+          videoUrl,
+          videoId: session.videoId,
+          cues: session.cues,
+        }
+        if (session.resume) {
+          // The File object is preserved as a Blob in IDB; cast it back to
+          // File so the rest of the pipeline (ffmpeg WORKERFS, name-based
+          // paths) keeps working.
+          const videoFile = session.videoBlob instanceof File
+            ? session.videoBlob
+            : new File([session.videoBlob], 'video.mkv')
+          const config: PipelineConfig = {
+            videoFile,
             videoId: session.videoId,
-            cues: session.cues,
-          })
+            source: session.resume.source,
+            sourceLang: session.resume.sourceLang,
+            email: session.resume.email,
+            initialCueCount: session.cues.length,
+          }
+          startBuildInternal(config, initialMedia)
+        } else {
+          setMedia(initialMedia)
+          mediaRef.current = initialMedia
         }
       })
       .catch(() => undefined)
       .finally(() => setRestoring(false))
-  }, [])
+  }, [startBuildInternal])
 
-  // Subtitle sync offset is per-video; load it when the video changes.
   useEffect(() => {
     setOffset(loadOffset(media?.videoId))
   }, [media?.videoId])
@@ -103,19 +199,52 @@ export default function App() {
     if (videoRef.current) videoRef.current.playbackRate = settings.speed
   }, [settings.speed, media?.videoId, videoRef])
 
-  // Persist the completed cue list once the pipeline finishes. Earlier
-  // intermediate states stay in the CC cache (for resume) but don't pollute
-  // the session store — we only land there with a fully-annotated set.
+  // Save in-progress state regularly while the pipeline is running, and
+  // again right before the tab goes hidden — covers backgrounding, swipe
+  // to recents, and explicit tab close.
+  useEffect(() => {
+    const running =
+      phase.kind === 'cc' || phase.kind === 'translate'
+    if (!running) return
+
+    const writeCurrent = (): Promise<unknown> | undefined => {
+      const m = mediaRef.current
+      const build = buildRef.current
+      if (!m || !build) return undefined
+      const record: StoredSession = {
+        videoId: m.videoId,
+        videoBlob: build.videoBlob,
+        cues: m.cues,
+        resume: build.resume,
+      }
+      return saveSession(record).catch(() => undefined)
+    }
+
+    const interval = window.setInterval(writeCurrent, PARTIAL_SAVE_INTERVAL_MS)
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') writeCurrent()
+    }
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => {
+      window.clearInterval(interval)
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
+  }, [phase.kind])
+
+  // Once the build is fully done, write the final session without resume
+  // info so the next launch reads it as "complete" rather than restarting
+  // the pipeline.
   useEffect(() => {
     if (phase.kind !== 'done') return
-    const blob = videoBlobRef.current
+    const build = buildRef.current
     const current = media
-    if (!blob || !current || blob.id !== current.videoId) return
+    if (!build || !current) return
     void saveSession({
       videoId: current.videoId,
-      videoBlob: blob.blob,
+      videoBlob: build.videoBlob,
       cues: current.cues,
     }).catch(() => undefined)
+    buildRef.current = null
   }, [phase, media])
 
   function handleToggle(key: TrackKey) {
@@ -123,40 +252,11 @@ export default function App() {
   }
 
   function startBuild(config: PipelineConfig) {
-    // Cancel anything already in flight (defensive: shouldn't happen).
-    pipelineRef.current?.cancel()
-
-    const videoUrl = URL.createObjectURL(config.videoFile)
-    videoBlobRef.current = { id: config.videoId, blob: config.videoFile }
-    // Open the player immediately with an empty cue list; cues stream in.
-    setMedia({ videoUrl, videoId: config.videoId, cues: [] })
-    setPhase({ kind: 'idle' })
-
-    // The previous session is no longer the one being viewed; drop it so a
-    // reload mid-build doesn't restore the wrong file.
+    // Picking a new file from FileSetup invalidates any earlier session;
+    // wipe both stores so we don't merge with stale data.
     void clearSession().catch(() => undefined)
-
-    pipelineRef.current = startPipeline(config, {
-      onCuesReplaced: (next) => {
-        setMedia((m) => (m && m.videoId === config.videoId ? { ...m, cues: next } : m))
-      },
-      onCuesAppended: (newCues) => {
-        setMedia((m) => {
-          if (!m || m.videoId !== config.videoId) return m
-          return { ...m, cues: [...m.cues, ...newCues] }
-        })
-      },
-      onCueUpdated: (i, patch) => {
-        setMedia((m) => {
-          if (!m || m.videoId !== config.videoId) return m
-          if (i < 0 || i >= m.cues.length) return m
-          const nextCues = m.cues.slice()
-          nextCues[i] = { ...nextCues[i], ...patch }
-          return { ...m, cues: nextCues }
-        })
-      },
-      onPhase: setPhase,
-    })
+    void clearCcProgress().catch(() => undefined)
+    startBuildInternal(config)
   }
 
   function handleBack() {
@@ -165,11 +265,8 @@ export default function App() {
     if (media) URL.revokeObjectURL(media.videoUrl)
     setMedia(null)
     setPhase({ kind: 'idle' })
-    videoBlobRef.current = null
-    // Drop the persisted session so the next launch shows FileSetup.
+    buildRef.current = null
     void clearSession().catch(() => undefined)
-    // CC cache is for resuming the in-flight build; explicit Back means
-    // "start over next time" rather than "resume", so drop it too.
     void clearCcProgress().catch(() => undefined)
   }
 

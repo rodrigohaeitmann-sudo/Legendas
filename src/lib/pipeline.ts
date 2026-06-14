@@ -35,6 +35,13 @@ export interface PipelineConfig {
   source: SubtitleSource
   sourceLang: SourceLang
   email?: string
+  /**
+   * When resuming from a persisted session, the App already holds the
+   * cues it had before reload. Setting this prevents onCuesReplaced /
+   * cached-cue re-append from clobbering the existing cue array. The
+   * pipeline still picks up new chunks from ccCache.chunkIndex.
+   */
+  initialCueCount?: number
 }
 
 export type PipelinePhase =
@@ -76,7 +83,8 @@ export function startPipeline(
   cb: PipelineCallbacks,
 ): PipelineHandle {
   const controller = new AbortController()
-  let totalCount = 0
+  const isResume = (config.initialCueCount ?? 0) > 0
+  let totalCount = config.initialCueCount ?? 0
   let cancelled = false
 
   function abort() {
@@ -125,18 +133,26 @@ export function startPipeline(
       cb.onPhase({ kind: 'error', message: 'Não encontrei legendas no arquivo.' })
       return
     }
-    const merged = srcCues.map(toMerged)
-    totalCount = merged.length
-    cb.onCuesReplaced(merged)
-    cb.onPhase({ kind: 'translate', done: 0, total: merged.length, failed: 0, provider: null })
+    if (!isResume) {
+      const merged = srcCues.map(toMerged)
+      cb.onCuesReplaced(merged)
+      totalCount = merged.length
+    }
+    cb.onPhase({ kind: 'translate', done: 0, total: srcCues.length, failed: 0, provider: null })
 
+    // On resume the translation cache makes most onLine calls return the
+    // already-known value almost instantly. We re-run the whole batch
+    // anyway so any cue that *didn't* get translated last session still
+    // gets a shot.
     await annotate(srcCues.map((c) => c.text), 0)
     if (!cancelled) cb.onPhase({ kind: 'done' })
   }
 
   async function runCc(model: WhisperModel) {
-    cb.onCuesReplaced([])
-    totalCount = 0
+    if (!isResume) {
+      cb.onCuesReplaced([])
+      totalCount = 0
+    }
 
     const cached = await loadCcProgress(config.videoId, config.sourceLang, model)
 
@@ -164,11 +180,14 @@ export function startPipeline(
     const cuesAccum: Cue[] = [...(cached?.cues ?? [])]
 
     // Replay anything previously transcribed so the user can watch with
-    // what's already done while we resume.
+    // what's already done while we resume. Skip the append when we're
+    // resuming from a session — App already has these cues in state.
     if (cuesAccum.length) {
-      const merged = cuesAccum.map(toMerged)
-      cb.onCuesAppended(merged)
-      totalCount += merged.length
+      if (!isResume) {
+        const merged = cuesAccum.map(toMerged)
+        cb.onCuesAppended(merged)
+        totalCount += merged.length
+      }
       annotateJobs.push(annotate(cuesAccum.map((c) => c.text), 0))
     }
 

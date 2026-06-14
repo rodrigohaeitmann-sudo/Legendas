@@ -590,3 +590,48 @@ button {
     margin-left: 100%;
   }
 }
+
+/* ---------- Pipeline progress banner (inside player) ---------- */
+.pipeline-banner {
+  padding: 8px 14px;
+  background: var(--panel);
+  border-bottom: 1px solid #232733;
+  font-size: 12px;
+  color: var(--muted);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.pipeline-banner.error {
+  color: #ff6b6b;
+}
+
+.pipeline-banner-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.pipeline-banner-label {
+  flex: 1;
+  word-break: break-word;
+}
+
+.pipeline-banner-pct {
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.pipeline-banner-bar {
+  height: 3px;
+  background: #232733;
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.pipeline-banner-bar-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.2s ease;
+}

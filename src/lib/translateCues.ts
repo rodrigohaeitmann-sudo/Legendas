@@ -16,6 +16,8 @@ export type ProviderId = 'mymemory' | 'google'
 export interface TranslateOptions {
   signal?: AbortSignal
   onProgress?: (p: TranslationProgress) => void
+  /** Fired the moment a single line's translation lands — for streaming UI. */
+  onLine?: (index: number, translation: string) => void
   email?: string
   source?: SourceLang
 }
@@ -155,6 +157,7 @@ export async function translateLines(
       const flat = flatten(lines[i])
       if (!flat) {
         results[i] = ''
+        opts.onLine?.(i, '')
         done++
         report()
         continue
@@ -163,6 +166,7 @@ export async function translateLines(
       const cached = await cacheGet(key)
       if (cached !== null) {
         results[i] = cached
+        opts.onLine?.(i, cached)
         done++
         report()
         continue
@@ -170,9 +174,11 @@ export async function translateLines(
       try {
         const t = await runner.translate(flat, opts.signal)
         results[i] = t
+        opts.onLine?.(i, t)
         void cacheSet(key, t)
       } catch {
         results[i] = ''
+        opts.onLine?.(i, '')
         failed++
       }
       done++

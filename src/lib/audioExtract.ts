@@ -11,7 +11,6 @@
 const SAMPLE_RATE = 16000
 const MOUNT_DIR = '/in'
 const OUT_PATH = '/out.pcm'
-const PROBE_PATH = '/duration.txt'
 
 let ffmpegPromise: Promise<import('@ffmpeg/ffmpeg').FFmpeg> | null = null
 // Which videoId is currently mounted at MOUNT_DIR. Mounting is cheap (no
@@ -85,23 +84,68 @@ async function ensureMounted(file: File, videoId: string) {
 }
 
 export async function probeDuration(file: File, videoId: string): Promise<number> {
+  // Primary: ask the browser. Free, near-instant, and the browser must
+  // already be able to demux this file (we're about to play it). This
+  // avoids the ffmpeg-core ffprobe path entirely, which on mobile WASM
+  // has been seen to abort with exit -1 against some MKV releases.
+  try {
+    return await probeViaMediaElement(file)
+  } catch (e) {
+    console.debug('[probe] media element failed:', e)
+  }
+
+  // Fallback: parse "Duration: HH:MM:SS.MS" out of ffmpeg's own stderr
+  // when running with -i and no output. ffmpeg exits non-zero in this
+  // mode (no output file specified) but emits the stream summary first,
+  // which is all we need.
   const ffmpeg = await ensureMounted(file, videoId)
-  const rc = await ffmpeg.ffprobe([
-    '-v', 'error',
-    '-show_entries', 'format=duration',
-    '-of', 'default=noprint_wrappers=1:nokey=1',
-    `${MOUNT_DIR}/${file.name}`,
-    '-o', PROBE_PATH,
-  ])
-  if (rc !== 0) throw new Error(`ffprobe exit ${rc}`)
-  const data = await ffmpeg.readFile(PROBE_PATH)
-  const text = typeof data === 'string' ? data : new TextDecoder().decode(data)
-  try { await ffmpeg.deleteFile(PROBE_PATH) } catch { /* ignore */ }
-  const dur = parseFloat(text.trim())
+  let stderr = ''
+  const handler = ({ message }: { message?: string }) => {
+    if (message) stderr += message + '\n'
+  }
+  ffmpeg.on('log', handler)
+  try {
+    await ffmpeg.exec(['-i', `${MOUNT_DIR}/${mountedName}`])
+  } catch {
+    /* expected to exit with non-zero */
+  } finally {
+    ffmpeg.off('log', handler)
+  }
+  const match = stderr.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/)
+  if (!match) {
+    throw new Error('não encontrei a duração no log do ffmpeg')
+  }
+  const dur = Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3])
   if (!isFinite(dur) || dur <= 0) {
-    throw new Error('duração inválida do vídeo')
+    throw new Error('duração inválida no log do ffmpeg')
   }
   return dur
+}
+
+async function probeViaMediaElement(file: File): Promise<number> {
+  return new Promise<number>((resolve, reject) => {
+    const video = document.createElement('video')
+    const url = URL.createObjectURL(file)
+    let settled = false
+    const settle = (fn: () => void) => {
+      if (settled) return
+      settled = true
+      URL.revokeObjectURL(url)
+      video.src = ''
+      fn()
+    }
+    video.preload = 'metadata'
+    video.muted = true
+    video.onloadedmetadata = () => {
+      const d = video.duration
+      if (Number.isFinite(d) && d > 0) settle(() => resolve(d))
+      else settle(() => reject(new Error('duração inválida via <video>')))
+    }
+    video.onerror = () => settle(() => reject(new Error('<video> não decodificou o arquivo')))
+    // Don't block the pipeline forever if the browser can't load metadata.
+    setTimeout(() => settle(() => reject(new Error('timeout ao ler metadados'))), 8000)
+    video.src = url
+  })
 }
 
 export interface RangeProgress {

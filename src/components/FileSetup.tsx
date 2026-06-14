@@ -1,9 +1,14 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { Cue, LoadedMedia, MergedCue } from '../types'
 import { parseSubtitles } from '../lib/parseSubtitles'
 import { phonemizeLines } from '../lib/phonemizer'
 import { translateLines, type TranslationProgress } from '../lib/translateCues'
 import { clearSession, saveSession } from '../lib/sessionStore'
+import {
+  clearCcProgress,
+  loadCcProgress,
+  saveCcProgress,
+} from '../lib/ccCache'
 import {
   extractAudio,
   transcribeAudio,
@@ -57,6 +62,20 @@ export default function FileSetup({ onReady }: Props) {
   const [progress, setProgress] = useState<SetupProgress | null>(null)
   const abortRef = useRef<AbortController | null>(null)
   const transcribeRef = useRef<TranscribeHandle | null>(null)
+  const wakeLockRef = useRef<WakeLockSentinel | null>(null)
+
+  // Mobile browsers auto-release the wake lock when the tab loses focus.
+  // If the user comes back while a CC run is still going, re-acquire it
+  // so the screen stays on for the rest of the work.
+  useEffect(() => {
+    function onVisibility() {
+      if (document.visibilityState === 'visible' && progress !== null && wakeLockRef.current === null) {
+        void acquireWakeLock(wakeLockRef)
+      }
+    }
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => document.removeEventListener('visibilitychange', onVisibility)
+  }, [progress])
 
   const canStart =
     videoFile !== null &&
@@ -113,22 +132,58 @@ export default function FileSetup({ onReady }: Props) {
     }
 
     // CC mode: decode the video's audio track and transcribe it locally.
-    setProgress({ kind: 'cc', phase: 'decode', pct: null })
+    const videoId = `${videoFile!.name}:${videoFile!.size}`
+    const cached = await loadCcProgress(videoId, sourceLang, whisperModel)
+
     let audio: Float32Array
-    try {
-      audio = await extractAudio(videoFile!, (ratio) =>
-        setProgress({ kind: 'cc', phase: 'decode', pct: ratio === null ? null : ratio * 100 }),
-      )
-    } catch (e) {
-      console.error('audio extraction failed', e)
-      const detail = e instanceof Error ? e.message : String(e)
-      setError(`Falha ao extrair o áudio: ${detail}`)
-      return null
+    if (cached?.audio) {
+      // Skip the extract phase entirely — same file, same audio.
+      audio = cached.audio
+    } else {
+      setProgress({ kind: 'cc', phase: 'decode', pct: null })
+      try {
+        audio = await extractAudio(videoFile!, (ratio) =>
+          setProgress({ kind: 'cc', phase: 'decode', pct: ratio === null ? null : ratio * 100 }),
+        )
+      } catch (e) {
+        console.error('audio extraction failed', e)
+        const detail = e instanceof Error ? e.message : String(e)
+        setError(`Falha ao extrair o áudio: ${detail}`)
+        return null
+      }
+      // Persist the audio right after extract so the next resume can skip
+      // straight to transcription.
+      await saveCcProgress({
+        videoId,
+        lang: sourceLang,
+        model: whisperModel,
+        audio,
+        cues: cached?.cues ?? [],
+        windowIndex: cached?.windowIndex ?? 0,
+        updatedAt: Date.now(),
+      })
     }
 
     const handle = transcribeAudio(audio, sourceLang, whisperModel, (p) =>
       setProgress({ kind: 'cc', phase: p.phase, pct: p.pct }),
-    )
+    {
+      resumeCues: cached?.cues,
+      resumeWindowIndex: cached?.windowIndex,
+      onWindowDone: (cues, windowIndex) => {
+        // Fire-and-forget; an in-flight save in progress when the next
+        // window completes is fine because saveCcProgress is keyed by
+        // videoId and overwrites.
+        void saveCcProgress({
+          videoId,
+          lang: sourceLang,
+          model: whisperModel,
+          audio,
+          cues,
+          windowIndex,
+          updatedAt: Date.now(),
+        })
+      },
+    })
     transcribeRef.current = handle
     try {
       const cues = await handle.promise
@@ -151,6 +206,7 @@ export default function FileSetup({ onReady }: Props) {
 
     const controller = new AbortController()
     abortRef.current = controller
+    await acquireWakeLock(wakeLockRef)
     try {
       const srcCues = await getSourceCues()
       if (!srcCues) {
@@ -189,6 +245,8 @@ export default function FileSetup({ onReady }: Props) {
 
       const videoId = `${videoFile.name}:${videoFile.size}`
       await clearSession().catch(() => undefined)
+      // CC progress is no longer needed — cues are now in the session store.
+      void clearCcProgress().catch(() => undefined)
       onReady({ videoUrl: URL.createObjectURL(videoFile), videoId, cues })
       void saveSession({ videoId, videoBlob: videoFile, cues }).catch(() => {
         // best-effort: storage quota or private mode; app still works this session
@@ -198,6 +256,7 @@ export default function FileSetup({ onReady }: Props) {
       setProgress(null)
     } finally {
       abortRef.current = null
+      releaseWakeLock(wakeLockRef)
     }
   }
 
@@ -206,6 +265,7 @@ export default function FileSetup({ onReady }: Props) {
     transcribeRef.current = null
     abortRef.current?.abort()
     abortRef.current = null
+    releaseWakeLock(wakeLockRef)
     setProgress(null)
   }
 
@@ -340,6 +400,29 @@ const CC_TITLES: Record<CcProgress['phase'], string> = {
   transcribe: 'Transcrevendo áudio…',
 }
 
+async function acquireWakeLock(ref: { current: WakeLockSentinel | null }) {
+  if (ref.current) return
+  try {
+    const wl = await navigator.wakeLock?.request('screen')
+    if (!wl) return
+    ref.current = wl
+    wl.addEventListener('release', () => {
+      if (ref.current === wl) ref.current = null
+    })
+  } catch {
+    // user denied, no permission, or unsupported — work proceeds, but the
+    // user will need to keep the screen on themselves.
+  }
+}
+
+function releaseWakeLock(ref: { current: WakeLockSentinel | null }) {
+  const wl = ref.current
+  ref.current = null
+  if (wl) {
+    void wl.release().catch(() => undefined)
+  }
+}
+
 function ProgressOverlay({
   progress,
   onCancel,
@@ -356,7 +439,7 @@ function ProgressOverlay({
     pct = progress.pct
     detail =
       progress.phase === 'transcribe'
-        ? `${Math.round(pct ?? 0)}% — pode demorar, mantenha o app aberto`
+        ? `${Math.round(pct ?? 0)}% — você pode trocar de app, o progresso é salvo`
         : pct !== null
           ? `${Math.round(pct)}%`
           : ''

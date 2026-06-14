@@ -79,11 +79,21 @@ export interface TranscribeHandle {
   cancel: () => void
 }
 
+export interface TranscribeOptions {
+  /** Cues already produced (from a previous interrupted run). */
+  resumeCues?: Cue[]
+  /** Number of windows already done; transcription resumes from this index. */
+  resumeWindowIndex?: number
+  /** Called after each window completes — caller persists for resume. */
+  onWindowDone?: (cues: Cue[], windowIndex: number, totalWindows: number) => void
+}
+
 export function transcribeAudio(
   audio: Float32Array,
   lang: SourceLang,
   model: WhisperModel,
   onProgress: (p: CcProgress) => void,
+  opts: TranscribeOptions = {},
 ): TranscribeHandle {
   const worker = new Worker(new URL('./transcribeWorker.ts', import.meta.url), {
     type: 'module',
@@ -95,12 +105,24 @@ export function transcribeAudio(
   let cancelled = false
 
   const promise = new Promise<Cue[]>((resolve, reject) => {
-    const cues: Cue[] = []
-    let windowIndex = 0
+    const cues: Cue[] = opts.resumeCues ? [...opts.resumeCues] : []
+    let windowIndex = Math.min(opts.resumeWindowIndex ?? 0, windowCount)
+
+    function reportTranscribeProgress() {
+      const doneSamples = bounds[windowIndex]
+      // No 99% cap: when every window is done we want the bar to actually
+      // reach 100% and then transition; the visual stall the user saw was
+      // partly from never crossing that threshold.
+      onProgress({
+        phase: 'transcribe',
+        pct: totalSamples ? (doneSamples / totalSamples) * 100 : 100,
+      })
+    }
 
     function sendNext() {
       if (cancelled) return
       if (windowIndex >= windowCount) {
+        reportTranscribeProgress()
         worker.terminate()
         resolve(cues)
         return
@@ -121,11 +143,8 @@ export function transcribeAudio(
       } else if (msg.type === 'window-done') {
         for (const c of msg.cues as Cue[]) cues.push(c)
         windowIndex++
-        const doneSamples = bounds[windowIndex]
-        onProgress({
-          phase: 'transcribe',
-          pct: Math.min(99, (doneSamples / totalSamples) * 100),
-        })
+        reportTranscribeProgress()
+        opts.onWindowDone?.(cues, windowIndex, windowCount)
         sendNext()
       } else if (msg.type === 'error') {
         worker.terminate()
@@ -135,6 +154,14 @@ export function transcribeAudio(
     worker.onerror = (e) => {
       worker.terminate()
       reject(new Error(e.message || 'worker error'))
+    }
+
+    if (windowIndex >= windowCount) {
+      // Everything's already cached from a previous run.
+      reportTranscribeProgress()
+      worker.terminate()
+      resolve(cues)
+      return
     }
 
     onProgress({ phase: 'model', pct: null })

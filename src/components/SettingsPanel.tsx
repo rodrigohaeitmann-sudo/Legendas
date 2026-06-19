@@ -5,6 +5,7 @@ interface Props {
   onChange: (settings: Settings) => void
   offset: number
   onOffsetChange: (offset: number) => void
+  onOpenSync: () => void
   onClose: () => void
 }
 
@@ -35,6 +36,7 @@ export default function SettingsPanel({
   onChange,
   offset,
   onOffsetChange,
+  onOpenSync,
   onClose,
 }: Props) {
   const set = (patch: Partial<Settings>) => onChange({ ...settings, ...patch })
@@ -114,6 +116,11 @@ export default function SettingsPanel({
           </div>
           <span className="setting-hint">+ atrasa a legenda · − adianta · 0 = sem ajuste</span>
         </div>
+
+        <button className="settings-link" onClick={onOpenSync}>
+          <span>🔖 Palavras salvas e sincronização</span>
+          <span className="settings-link-arrow">→</span>
+        </button>
       </div>
     </div>
   )

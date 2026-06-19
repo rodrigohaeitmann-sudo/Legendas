@@ -22,19 +22,29 @@ import SubtitlePanel from './components/SubtitlePanel'
 import ControlsFooter from './components/ControlsFooter'
 import SettingsPanel from './components/SettingsPanel'
 import PipelineBanner from './components/PipelineBanner'
+import SyncPanel from './components/SyncPanel'
 
 const TOGGLES_KEY = 'legendas.toggles'
 const SETTINGS_KEY = 'legendas.settings'
 const DEFAULT_TOGGLES: Toggles = { ipa: true, en: true, pt: true }
-const DEFAULT_SETTINGS: Settings = { fontScale: 1, fontFamily: 'system', speed: 1 }
+// Default to the editorial serif (Newsreader) so the amber theme reads as
+// designed out of the box; users can switch back to sans in Settings.
+const DEFAULT_SETTINGS: Settings = { fontScale: 1, fontFamily: 'serif', speed: 1 }
 // How often to write the in-progress session to IndexedDB while the
 // pipeline keeps streaming cues in.
 const PARTIAL_SAVE_INTERVAL_MS = 5000
 
 const FONT_STACKS: Record<Settings['fontFamily'], string> = {
-  system: "system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif",
-  serif: "Georgia, 'Times New Roman', serif",
+  system: "'Hanken Grotesk', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif",
+  serif: "'Newsreader', Georgia, 'Times New Roman', serif",
   mono: "ui-monospace, 'SF Mono', Menlo, Consolas, monospace",
+}
+
+// Friendly chapter label for saved words: the video filename without the
+// ":<size>" suffix baked into videoId.
+function videoChapter(videoId?: string): string {
+  if (!videoId) return ''
+  return videoId.replace(/:\d+$/, '')
 }
 
 function loadJson<T>(key: string, fallback: T): T {
@@ -64,6 +74,7 @@ export default function App() {
   const [settings, setSettings] = useState<Settings>(() => loadJson(SETTINGS_KEY, DEFAULT_SETTINGS))
   const [offset, setOffset] = useState(0)
   const [showSettings, setShowSettings] = useState(false)
+  const [showSync, setShowSync] = useState(false)
   const [phase, setPhase] = useState<PipelinePhase>({ kind: 'idle' })
 
   const pipelineRef = useRef<PipelineHandle | null>(null)
@@ -275,7 +286,12 @@ export default function App() {
   }
 
   if (!media) {
-    return <FileSetup onStart={startBuild} />
+    return (
+      <>
+        <FileSetup onStart={startBuild} onOpenSync={() => setShowSync(true)} />
+        {showSync && <SyncPanel onClose={() => setShowSync(false)} />}
+      </>
+    )
   }
 
   const currentCue: MergedCue | null = activeIndex >= 0 ? cues[activeIndex] : null
@@ -298,7 +314,7 @@ export default function App() {
       />
       <PipelineBanner phase={phase} />
       <SubtitleToggles toggles={toggles} onToggle={handleToggle} />
-      <SubtitlePanel cue={currentCue} toggles={toggles} />
+      <SubtitlePanel cue={currentCue} toggles={toggles} chapter={videoChapter(media.videoId)} />
       <ControlsFooter
         isPlaying={isPlaying}
         onPrev={prev}
@@ -311,9 +327,14 @@ export default function App() {
           onChange={setSettings}
           offset={offset}
           onOffsetChange={setOffset}
+          onOpenSync={() => {
+            setShowSettings(false)
+            setShowSync(true)
+          }}
           onClose={() => setShowSettings(false)}
         />
       )}
+      {showSync && <SyncPanel onClose={() => setShowSync(false)} />}
     </div>
   )
 }

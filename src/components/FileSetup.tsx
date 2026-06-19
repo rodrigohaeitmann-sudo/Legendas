@@ -10,6 +10,7 @@ import type { PipelineConfig } from '../lib/pipeline'
 
 interface Props {
   onStart: (config: PipelineConfig) => void
+  onOpenSync: () => void
 }
 
 type SubtitleSource = 'srt' | 'audio'
@@ -28,7 +29,7 @@ function loadWhisperModel(): WhisperModel {
   return WHISPER_MODELS.some((m) => m.id === stored) ? (stored as WhisperModel) : 'base'
 }
 
-export default function FileSetup({ onStart }: Props) {
+export default function FileSetup({ onStart, onOpenSync }: Props) {
   const [subSource, setSubSource] = useState<SubtitleSource>('srt')
   const [videoFile, setVideoFile] = useState<File | null>(null)
   const [srtFile, setSrtFile] = useState<File | null>(null)
@@ -110,7 +111,12 @@ export default function FileSetup({ onStart }: Props) {
 
   return (
     <div className="setup">
-      <h1>Treino de Listening</h1>
+      <div className="setup-topbar">
+        <h1>Treino de Listening</h1>
+        <button className="setup-sync-btn" aria-label="Palavras salvas e sincronização" onClick={onOpenSync}>
+          🔖
+        </button>
+      </div>
       <p className="setup-hint">
         Escolha o vídeo e a legenda. A reprodução começa imediatamente; tradução e
         transcrição fonética chegam em segundo plano enquanto você assiste.

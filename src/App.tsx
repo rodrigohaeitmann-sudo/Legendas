@@ -15,14 +15,8 @@ import {
   type PipelinePhase,
 } from './lib/pipeline'
 import { clearCcProgress } from './lib/ccCache'
-import { extractFullAudio, probeAudioTracks } from './lib/audioExtract'
-import {
-  audioStreamKey,
-  bytesToBlobUrl,
-  clearAudioStreamCache,
-  loadCachedAudio,
-  saveCachedAudio,
-} from './lib/audioStream'
+import { probeAudioTracks, probeDuration } from './lib/audioExtract'
+import { createAudioStream, type StreamHandle } from './lib/audioStreamMse'
 import FileSetup from './components/FileSetup'
 import VideoStage from './components/VideoStage'
 import SubtitleToggles from './components/SubtitleToggles'
@@ -137,17 +131,17 @@ export default function App() {
     })
   }, [])
 
-  // Background job that extracts the chosen audio track and hands its
-  // blob URL to <VideoStage> for synced playback. Token guards against an
-  // in-flight extraction landing after the user has gone Back / picked a
-  // different video.
+  // Streams the chosen audio track to the <audio> element via MSE — small
+  // first chunk for fast start, subsequent chunks fed ahead of the playhead.
+  // Token guards against a stream landing after the user has gone Back or
+  // picked a different video.
   const audioTokenRef = useRef(0)
-  const audioObjectUrlRef = useRef<string | null>(null)
+  const audioStreamRef = useRef<StreamHandle | null>(null)
 
   const releaseAudio = useCallback(() => {
-    if (audioObjectUrlRef.current) {
-      URL.revokeObjectURL(audioObjectUrlRef.current)
-      audioObjectUrlRef.current = null
+    if (audioStreamRef.current) {
+      audioStreamRef.current.cancel()
+      audioStreamRef.current = null
     }
     setAudioSrc(null)
     setAudioStatus({ kind: 'idle' })
@@ -155,24 +149,19 @@ export default function App() {
 
   const runAudioTrackExtraction = useCallback((config: PipelineConfig) => {
     releaseAudio()
-    // Track 0 is what the browser plays by default — no extraction needed.
+    // Track 0 is what the browser plays by default — no streaming needed.
     if (config.audioTrackIndex === 0) return
     const token = ++audioTokenRef.current
-    const key = audioStreamKey(config.videoId, config.audioTrackIndex)
 
     void (async () => {
       try {
-        const cached = await loadCachedAudio(key)
-        if (token !== audioTokenRef.current) return
-        if (cached) {
-          const url = bytesToBlobUrl(cached)
-          audioObjectUrlRef.current = url
-          setAudioSrc(url)
-          setAudioStatus({ kind: 'idle' })
-          return
-        }
         setAudioStatus({ kind: 'extracting', pct: null })
-        // Probe to get the codec — we need it to decide copy vs transcode.
+        // Need duration up front so MSE knows the overall timeline and
+        // seeks work even before the entire stream is buffered.
+        const duration = await probeDuration(config.videoFile, config.videoId)
+        if (token !== audioTokenRef.current) return
+        // Probe just to validate the track index is real; the streamer
+        // transcodes universally to AAC-LC so we don't need the codec name.
         const tracks = await probeAudioTracks(config.videoFile, config.videoId)
         if (token !== audioTokenRef.current) return
         const track = tracks[config.audioTrackIndex]
@@ -180,25 +169,36 @@ export default function App() {
           setAudioStatus({ kind: 'error', message: 'Faixa de áudio não encontrada.' })
           return
         }
-        const bytes = await extractFullAudio(
+
+        const stream = createAudioStream(
           config.videoFile,
           config.videoId,
           config.audioTrackIndex,
-          track.codec,
+          duration,
           (p) => {
             if (token !== audioTokenRef.current) return
-            setAudioStatus({ kind: 'extracting', pct: p.ratio === null ? null : p.ratio * 100 })
+            // Surface coarse % so the banner advances while we buffer ahead.
+            const pct = duration > 0 ? Math.min(100, (p.bufferedTo / duration) * 100) : null
+            if (!p.firstReady) {
+              setAudioStatus({ kind: 'extracting', pct })
+            } else if (p.bufferedTo < duration) {
+              // First chunk landed — playback can start; keep the banner up
+              // (but it'll auto-hide once we're fully buffered).
+              setAudioStatus({ kind: 'extracting', pct })
+            } else {
+              setAudioStatus({ kind: 'idle' })
+            }
           },
         )
-        if (token !== audioTokenRef.current) return
-        void saveCachedAudio(key, bytes).catch(() => undefined)
-        const url = bytesToBlobUrl(bytes)
-        audioObjectUrlRef.current = url
-        setAudioSrc(url)
-        setAudioStatus({ kind: 'idle' })
+        if (token !== audioTokenRef.current) {
+          stream.cancel()
+          return
+        }
+        audioStreamRef.current = stream
+        setAudioSrc(stream.url)
       } catch (e) {
         if (token !== audioTokenRef.current) return
-        console.error('audio track extraction failed', e)
+        console.error('audio stream setup failed', e)
         setAudioStatus({
           kind: 'error',
           message: `Falha ao preparar áudio: ${e instanceof Error ? e.message : String(e)}`,
@@ -326,6 +326,12 @@ export default function App() {
     if (videoRef.current) videoRef.current.playbackRate = settings.speed
   }, [settings.speed, media?.videoId, videoRef])
 
+  // Keep the MSE feeder informed about the playhead so it pulls ahead at
+  // the right pace and resumes after a seek.
+  useEffect(() => {
+    audioStreamRef.current?.setPlaybackTime(currentTime)
+  }, [currentTime])
+
   // Save in-progress state regularly while the pipeline is running, and
   // again right before the tab goes hidden — covers backgrounding, swipe
   // to recents, and explicit tab close.
@@ -399,7 +405,6 @@ export default function App() {
     buildRef.current = null
     void clearSession().catch(() => undefined)
     void clearCcProgress().catch(() => undefined)
-    void clearAudioStreamCache().catch(() => undefined)
   }
 
   if (restoring) {

@@ -275,42 +275,48 @@ export async function extractAudioRange(
   }
 }
 
-// Extracts the chosen audio track as a playable M4A blob. Used to fix
-// dual-audio MKVs where the browser plays the wrong track and won't let JS
-// switch — we mute the <video> element and play the extracted track from a
-// separate <audio> element synced to it (see VideoStage).
+// Extracts a fragmented MP4 (fMP4) audio chunk suitable for feeding to a
+// MediaSource via MSE. Each chunk contains its own ftyp + moov so the first
+// one can be sent as the init segment; we strip the ftyp + moov from the
+// rest in audioStreamMse.ts and forward only the moof + mdat boxes.
 //
-// AAC / MP3 streams are copied with no re-encoding (-c:a copy → fast, ~30 s
-// for a 45-min file on mobile WASM). Other codecs (AC3, DTS, Opus in MKV)
-// are transcoded to AAC 128 kbps so the resulting M4A always plays in any
-// browser, regardless of source codec licensing.
-export async function extractFullAudio(
+// We always transcode to AAC-LC 128 kbps for two reasons: (1) the resulting
+// codec string is predictable (mp4a.40.2 plays everywhere); (2) some
+// containers' source streams use codecs MSE refuses (AC3, DTS) — avoiding
+// that branching keeps the streaming path simple. Audio-only AAC encoding
+// is fast on mobile WASM (~3x realtime).
+export async function extractAudioFmp4(
   file: File,
   videoId: string,
   trackIndex: number,
-  codec: string,
-  onProgress: (p: RangeProgress) => void,
+  startSec: number,
+  durationSec: number,
+  onProgress?: (p: RangeProgress) => void,
 ): Promise<Uint8Array> {
   const ffmpeg = await ensureMounted(file, videoId)
-  const out = '/full-audio.m4a'
+  const out = '/audio-chunk.mp4'
 
-  const progressListener = ({ progress }: { progress: number }) => {
-    onProgress({ ratio: Math.max(0, Math.min(1, progress)) })
-  }
-  ffmpeg.on('progress', progressListener)
-  onProgress({ ratio: null })
+  const progressListener = onProgress
+    ? ({ progress }: { progress: number }) =>
+        onProgress({ ratio: Math.max(0, Math.min(1, progress)) })
+    : undefined
+  if (progressListener) ffmpeg.on('progress', progressListener)
+  onProgress?.({ ratio: null })
 
   try {
-    const codecLower = codec.toLowerCase()
-    const canCopy =
-      codecLower === 'aac' || codecLower === 'mp3' || codecLower === 'mp4a'
-    const codecArgs = canCopy ? ['-c:a', 'copy'] : ['-c:a', 'aac', '-b:a', '128k']
     const rc = await ffmpeg.exec([
+      '-ss', String(startSec),
+      '-accurate_seek',
+      '-t', String(durationSec),
       '-i', `${MOUNT_DIR}/${mountedName}`,
       '-vn',
       '-map', `0:a:${trackIndex}`,
-      ...codecArgs,
-      '-movflags', '+faststart',
+      '-c:a', 'aac',
+      '-b:a', '128k',
+      '-profile:a', 'aac_low',
+      '-f', 'mp4',
+      '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+      '-frag_duration', '1000000',
       out,
     ])
     if (rc !== 0) throw new Error(`ffmpeg exit ${rc}`)
@@ -321,7 +327,7 @@ export async function extractFullAudio(
     try { await ffmpeg.deleteFile(out) } catch { /* ignore */ }
     return copy
   } finally {
-    ffmpeg.off('progress', progressListener)
+    if (progressListener) ffmpeg.off('progress', progressListener)
   }
 }
 

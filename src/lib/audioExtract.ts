@@ -153,12 +153,86 @@ export interface RangeProgress {
   ratio: number | null
 }
 
+export interface AudioTrack {
+  /** Index among audio streams only — what `-map 0:a:N` expects. */
+  index: number
+  /** Codec name as reported by ffmpeg (aac, ac3, eac3, dts, opus, …). */
+  codec: string
+  /** ISO 639-1/2 language tag from the container, if present. */
+  language?: string
+  /** Number of channels (1=mono, 2=stereo, 6=5.1, …). */
+  channels?: number
+  /** Whether the container marks this as the default audio. */
+  isDefault: boolean
+}
+
+// Pulls the audio-stream summary out of `ffmpeg -i <file>` stderr. We use
+// our existing ffmpeg singleton + mount, so the only cost is one extra
+// no-output run; on MKVs with dual audio this is exactly what the user
+// needs in order to pick the right language for CC.
+export async function probeAudioTracks(file: File, videoId: string): Promise<AudioTrack[]> {
+  const ffmpeg = await ensureMounted(file, videoId)
+  let stderr = ''
+  const handler = ({ message }: { message?: string }) => {
+    if (message) stderr += message + '\n'
+  }
+  ffmpeg.on('log', handler)
+  try {
+    await ffmpeg.exec(['-i', `${MOUNT_DIR}/${mountedName}`])
+  } catch {
+    /* exits non-zero because no output is specified */
+  } finally {
+    ffmpeg.off('log', handler)
+  }
+  return parseAudioStreams(stderr)
+}
+
+function parseAudioStreams(stderr: string): AudioTrack[] {
+  // Match lines like:
+  //   Stream #0:1(fre): Audio: aac (LC), 48000 Hz, stereo, fltp, 192 kb/s (default)
+  //   Stream #0:2(por): Audio: ac3, 48000 Hz, 5.1(side), fltp, 384 kb/s
+  //   Stream #0:1[0x82]: Audio: ac3, 48000 Hz, stereo, fltp, 192 kb/s
+  const re =
+    /Stream #\d+:\d+(?:\[[^\]]+\])?(?:\(([^)]+)\))?(?:[^:\n]*?)?:\s*Audio:\s*([A-Za-z0-9_]+)(?:\s*\([^)]*\))?(?:[^,]*?)(?:,\s*(\d+)\s*Hz)?(?:,\s*([^,(\n]+(?:\([^)]*\))?))?/g
+  const tracks: AudioTrack[] = []
+  let audioIdx = 0
+  let m: RegExpExecArray | null
+  while ((m = re.exec(stderr)) !== null) {
+    // Whole match line (re.lastIndex is just past it); look behind to see if
+    // "(default)" appears on the same line.
+    const lineStart = stderr.lastIndexOf('\n', m.index) + 1
+    const lineEnd = stderr.indexOf('\n', re.lastIndex)
+    const line = stderr.slice(lineStart, lineEnd === -1 ? undefined : lineEnd)
+    tracks.push({
+      index: audioIdx,
+      language: m[1] || undefined,
+      codec: (m[2] || 'audio').toLowerCase(),
+      channels: m[4] ? parseChannelLabel(m[4]) : undefined,
+      isDefault: /\(default\)/.test(line),
+    })
+    audioIdx++
+  }
+  return tracks
+}
+
+function parseChannelLabel(label: string): number | undefined {
+  const cleaned = label.trim().toLowerCase()
+  if (cleaned === 'mono') return 1
+  if (cleaned === 'stereo') return 2
+  if (cleaned.startsWith('5.1')) return 6
+  if (cleaned.startsWith('7.1')) return 8
+  if (cleaned.startsWith('2.1')) return 3
+  const m = cleaned.match(/^(\d+)\s*channels?/)
+  return m ? Number(m[1]) : undefined
+}
+
 export async function extractAudioRange(
   file: File,
   videoId: string,
   startSec: number,
   durationSec: number,
   onProgress: (p: RangeProgress) => void,
+  audioTrackIndex = 0,
 ): Promise<Float32Array> {
   const ffmpeg = await ensureMounted(file, videoId)
 
@@ -174,13 +248,15 @@ export async function extractAudioRange(
     // Followed by -accurate_seek so the decoded range still starts at the
     // exact requested second — Whisper timestamps would otherwise drift by
     // whatever the keyframe interval is (~1-2s for most MKV releases).
+    // -map 0:a:<index> picks the chosen audio track (defaults to the first
+    // one, but dual-audio MKVs often need a specific one).
     const rc = await ffmpeg.exec([
       '-ss', String(startSec),
       '-accurate_seek',
       '-t', String(durationSec),
       '-i', `${MOUNT_DIR}/${mountedName}`,
       '-vn',
-      '-map', '0:a:0',
+      '-map', `0:a:${audioTrackIndex}`,
       '-ac', '1',
       '-ar', String(SAMPLE_RATE),
       '-f', 'f32le',

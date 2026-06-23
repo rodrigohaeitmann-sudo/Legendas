@@ -13,7 +13,7 @@ export interface SessionResume {
   email?: string
   source:
     | { kind: 'srt'; text: string }
-    | { kind: 'cc'; whisperModel: WhisperModel }
+    | { kind: 'cc'; whisperModel: WhisperModel; audioTrackIndex: number }
 }
 
 export interface StoredSession {

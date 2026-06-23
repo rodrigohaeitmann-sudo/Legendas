@@ -127,6 +127,10 @@ button {
   word-break: break-all;
 }
 
+.file-field small.hint {
+  color: var(--muted);
+}
+
 .setup-error {
   color: var(--danger);
   font-size: 14px;

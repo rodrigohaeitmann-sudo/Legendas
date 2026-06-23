@@ -27,7 +27,7 @@ const CHUNK_SECONDS = 180 // 3 min — short enough that the first cues
 
 export type SubtitleSource =
   | { kind: 'srt'; text: string }
-  | { kind: 'cc'; whisperModel: WhisperModel }
+  | { kind: 'cc'; whisperModel: WhisperModel; audioTrackIndex: number }
 
 export interface PipelineConfig {
   videoFile: File
@@ -148,7 +148,7 @@ export function startPipeline(
     if (!cancelled) cb.onPhase({ kind: 'done' })
   }
 
-  async function runCc(model: WhisperModel) {
+  async function runCc(model: WhisperModel, audioTrackIndex: number) {
     if (!isResume) {
       cb.onCuesReplaced([])
       totalCount = 0
@@ -218,16 +218,23 @@ export function startPipeline(
         })
         let audio: Float32Array
         try {
-          audio = await extractAudioRange(config.videoFile, config.videoId, startSec, dur, (p) => {
-            if (cancelled) return
-            cb.onPhase({
-              kind: 'cc',
-              step: 'extract',
-              chunkIndex,
-              totalChunks,
-              pct: p.ratio === null ? null : p.ratio * 100,
-            })
-          })
+          audio = await extractAudioRange(
+            config.videoFile,
+            config.videoId,
+            startSec,
+            dur,
+            (p) => {
+              if (cancelled) return
+              cb.onPhase({
+                kind: 'cc',
+                step: 'extract',
+                chunkIndex,
+                totalChunks,
+                pct: p.ratio === null ? null : p.ratio * 100,
+              })
+            },
+            audioTrackIndex,
+          )
         } catch (e) {
           cb.onPhase({
             kind: 'error',
@@ -298,7 +305,7 @@ export function startPipeline(
       if (config.source.kind === 'srt') {
         await runSrt(config.source.text)
       } else {
-        await runCc(config.source.whisperModel)
+        await runCc(config.source.whisperModel, config.source.audioTrackIndex)
       }
     } catch (e) {
       if (!cancelled) {

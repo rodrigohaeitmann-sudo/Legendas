@@ -76,6 +76,9 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false)
   const [showSync, setShowSync] = useState(false)
   const [phase, setPhase] = useState<PipelinePhase>({ kind: 'idle' })
+  // Files handed to us by the OS when the PWA is launched via "Open with"
+  // from a file manager — funnelled into FileSetup as pre-filled inputs.
+  const [incomingFiles, setIncomingFiles] = useState<File[]>([])
 
   const pipelineRef = useRef<PipelineHandle | null>(null)
   // Latest media kept in a ref so the periodic save interval doesn't go
@@ -97,6 +100,29 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings))
   }, [settings])
+
+  // PWA "Open with…" hand-off: when the user launches the installed app from
+  // a file manager (Android picks the PWA because of file_handlers in the
+  // manifest), Chrome routes the chosen files through LaunchQueue. Pull them
+  // out and stash on state — FileSetup wires them into its file inputs.
+  useEffect(() => {
+    const lq = (window as unknown as {
+      launchQueue?: {
+        setConsumer: (cb: (params: { files?: FileSystemFileHandle[] }) => void) => void
+      }
+    }).launchQueue
+    if (!lq) return
+    lq.setConsumer(async (params) => {
+      const handles = params.files
+      if (!handles || handles.length === 0) return
+      try {
+        const files = await Promise.all(handles.map((h) => h.getFile()))
+        setIncomingFiles(files)
+      } catch (e) {
+        console.error('launchQueue file read failed', e)
+      }
+    })
+  }, [])
 
   const startBuildInternal = useCallback(
     (config: PipelineConfig, initialMedia?: LoadedMedia) => {
@@ -288,7 +314,12 @@ export default function App() {
   if (!media) {
     return (
       <>
-        <FileSetup onStart={startBuild} onOpenSync={() => setShowSync(true)} />
+        <FileSetup
+          onStart={startBuild}
+          onOpenSync={() => setShowSync(true)}
+          initialFiles={incomingFiles}
+          onInitialFilesConsumed={() => setIncomingFiles([])}
+        />
         {showSync && <SyncPanel onClose={() => setShowSync(false)} />}
       </>
     )

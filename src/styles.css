@@ -56,12 +56,18 @@ button {
 
 /* ---------- Setup screen ---------- */
 .setup {
-  min-height: 100dvh;
+  /* height (not min-height) is required: body has overflow:hidden, so for
+     overflow-y:auto here to actually scroll, the container itself needs a
+     constrained height. With min-height the container grew with its
+     contents and the part past the viewport was clipped by the body. */
+  height: 100dvh;
   display: flex;
   flex-direction: column;
   gap: 18px;
   padding: 24px 22px calc(24px + env(safe-area-inset-bottom));
   overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
 }
 
 .setup-topbar {

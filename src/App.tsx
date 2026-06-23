@@ -15,13 +15,21 @@ import {
   type PipelinePhase,
 } from './lib/pipeline'
 import { clearCcProgress } from './lib/ccCache'
+import { extractFullAudio, probeAudioTracks } from './lib/audioExtract'
+import {
+  audioStreamKey,
+  bytesToBlobUrl,
+  clearAudioStreamCache,
+  loadCachedAudio,
+  saveCachedAudio,
+} from './lib/audioStream'
 import FileSetup from './components/FileSetup'
 import VideoStage from './components/VideoStage'
 import SubtitleToggles from './components/SubtitleToggles'
 import SubtitlePanel from './components/SubtitlePanel'
 import ControlsFooter from './components/ControlsFooter'
 import SettingsPanel from './components/SettingsPanel'
-import PipelineBanner from './components/PipelineBanner'
+import PipelineBanner, { type AudioStatus } from './components/PipelineBanner'
 import SyncPanel from './components/SyncPanel'
 
 const TOGGLES_KEY = 'legendas.toggles'
@@ -79,6 +87,11 @@ export default function App() {
   // Files handed to us by the OS when the PWA is launched via "Open with"
   // from a file manager — funnelled into FileSetup as pre-filled inputs.
   const [incomingFiles, setIncomingFiles] = useState<File[]>([])
+  // Replacement audio track URL + extraction progress, for dual-audio MKVs
+  // where the user chose a non-default track. null = play the video's own
+  // audio (browser default).
+  const [audioSrc, setAudioSrc] = useState<string | null>(null)
+  const [audioStatus, setAudioStatus] = useState<AudioStatus>({ kind: 'idle' })
 
   const pipelineRef = useRef<PipelineHandle | null>(null)
   // Latest media kept in a ref so the periodic save interval doesn't go
@@ -124,6 +137,76 @@ export default function App() {
     })
   }, [])
 
+  // Background job that extracts the chosen audio track and hands its
+  // blob URL to <VideoStage> for synced playback. Token guards against an
+  // in-flight extraction landing after the user has gone Back / picked a
+  // different video.
+  const audioTokenRef = useRef(0)
+  const audioObjectUrlRef = useRef<string | null>(null)
+
+  const releaseAudio = useCallback(() => {
+    if (audioObjectUrlRef.current) {
+      URL.revokeObjectURL(audioObjectUrlRef.current)
+      audioObjectUrlRef.current = null
+    }
+    setAudioSrc(null)
+    setAudioStatus({ kind: 'idle' })
+  }, [])
+
+  const runAudioTrackExtraction = useCallback((config: PipelineConfig) => {
+    releaseAudio()
+    // Track 0 is what the browser plays by default — no extraction needed.
+    if (config.audioTrackIndex === 0) return
+    const token = ++audioTokenRef.current
+    const key = audioStreamKey(config.videoId, config.audioTrackIndex)
+
+    void (async () => {
+      try {
+        const cached = await loadCachedAudio(key)
+        if (token !== audioTokenRef.current) return
+        if (cached) {
+          const url = bytesToBlobUrl(cached)
+          audioObjectUrlRef.current = url
+          setAudioSrc(url)
+          setAudioStatus({ kind: 'idle' })
+          return
+        }
+        setAudioStatus({ kind: 'extracting', pct: null })
+        // Probe to get the codec — we need it to decide copy vs transcode.
+        const tracks = await probeAudioTracks(config.videoFile, config.videoId)
+        if (token !== audioTokenRef.current) return
+        const track = tracks[config.audioTrackIndex]
+        if (!track) {
+          setAudioStatus({ kind: 'error', message: 'Faixa de áudio não encontrada.' })
+          return
+        }
+        const bytes = await extractFullAudio(
+          config.videoFile,
+          config.videoId,
+          config.audioTrackIndex,
+          track.codec,
+          (p) => {
+            if (token !== audioTokenRef.current) return
+            setAudioStatus({ kind: 'extracting', pct: p.ratio === null ? null : p.ratio * 100 })
+          },
+        )
+        if (token !== audioTokenRef.current) return
+        void saveCachedAudio(key, bytes).catch(() => undefined)
+        const url = bytesToBlobUrl(bytes)
+        audioObjectUrlRef.current = url
+        setAudioSrc(url)
+        setAudioStatus({ kind: 'idle' })
+      } catch (e) {
+        if (token !== audioTokenRef.current) return
+        console.error('audio track extraction failed', e)
+        setAudioStatus({
+          kind: 'error',
+          message: `Falha ao preparar áudio: ${e instanceof Error ? e.message : String(e)}`,
+        })
+      }
+    })()
+  }, [releaseAudio])
+
   const startBuildInternal = useCallback(
     (config: PipelineConfig, initialMedia?: LoadedMedia) => {
       pipelineRef.current?.cancel()
@@ -143,9 +226,15 @@ export default function App() {
         resume: {
           sourceLang: config.sourceLang,
           email: config.email,
+          audioTrackIndex: config.audioTrackIndex,
           source: config.source,
         },
       }
+
+      // Kick off background extraction of the chosen audio track when it
+      // isn't track 0 — fixes dual-audio MKVs where the browser plays the
+      // wrong language. Track 0 is the browser default; trust it.
+      runAudioTrackExtraction(config)
 
       // Write an immediate baseline so even a fast reload right after
       // Start still finds the file + resume info in IDB.
@@ -178,7 +267,7 @@ export default function App() {
         onPhase: setPhase,
       })
     },
-    [],
+    [runAudioTrackExtraction],
   )
 
   // Auto-restore on launch. If the previous session was still building
@@ -207,6 +296,7 @@ export default function App() {
             source: session.resume.source,
             sourceLang: session.resume.sourceLang,
             email: session.resume.email,
+            audioTrackIndex: session.resume.audioTrackIndex ?? 0,
             initialCueCount: session.cues.length,
           }
           startBuildInternal(config, initialMedia)
@@ -290,7 +380,9 @@ export default function App() {
 
   function startBuild(config: PipelineConfig) {
     // Picking a new file from FileSetup invalidates any earlier session;
-    // wipe both stores so we don't merge with stale data.
+    // wipe both stores so we don't merge with stale data. The audio
+    // stream cache is keyed by videoId+track, so it survives a re-open of
+    // the same file; only Back wipes it explicitly.
     void clearSession().catch(() => undefined)
     void clearCcProgress().catch(() => undefined)
     startBuildInternal(config)
@@ -299,12 +391,15 @@ export default function App() {
   function handleBack() {
     pipelineRef.current?.cancel()
     pipelineRef.current = null
+    audioTokenRef.current++ // invalidate any in-flight extraction job
+    releaseAudio()
     if (media) URL.revokeObjectURL(media.videoUrl)
     setMedia(null)
     setPhase({ kind: 'idle' })
     buildRef.current = null
     void clearSession().catch(() => undefined)
     void clearCcProgress().catch(() => undefined)
+    void clearAudioStreamCache().catch(() => undefined)
   }
 
   if (restoring) {
@@ -336,6 +431,7 @@ export default function App() {
       <VideoStage
         videoRef={videoRef}
         src={media.videoUrl}
+        audioSrc={audioSrc}
         currentTime={currentTime}
         duration={duration}
         isPlaying={isPlaying}
@@ -343,7 +439,7 @@ export default function App() {
         onBack={handleBack}
         onOpenSettings={() => setShowSettings(true)}
       />
-      <PipelineBanner phase={phase} />
+      <PipelineBanner phase={phase} audio={audioStatus} />
       <SubtitleToggles toggles={toggles} onToggle={handleToggle} />
       <SubtitlePanel cue={currentCue} toggles={toggles} chapter={videoChapter(media.videoId)} />
       <ControlsFooter

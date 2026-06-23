@@ -11,9 +11,10 @@ const KEY = 'last'
 export interface SessionResume {
   sourceLang: SourceLang
   email?: string
+  audioTrackIndex: number
   source:
     | { kind: 'srt'; text: string }
-    | { kind: 'cc'; whisperModel: WhisperModel; audioTrackIndex: number }
+    | { kind: 'cc'; whisperModel: WhisperModel }
 }
 
 export interface StoredSession {

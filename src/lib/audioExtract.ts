@@ -275,6 +275,56 @@ export async function extractAudioRange(
   }
 }
 
+// Extracts the chosen audio track as a playable M4A blob. Used to fix
+// dual-audio MKVs where the browser plays the wrong track and won't let JS
+// switch — we mute the <video> element and play the extracted track from a
+// separate <audio> element synced to it (see VideoStage).
+//
+// AAC / MP3 streams are copied with no re-encoding (-c:a copy → fast, ~30 s
+// for a 45-min file on mobile WASM). Other codecs (AC3, DTS, Opus in MKV)
+// are transcoded to AAC 128 kbps so the resulting M4A always plays in any
+// browser, regardless of source codec licensing.
+export async function extractFullAudio(
+  file: File,
+  videoId: string,
+  trackIndex: number,
+  codec: string,
+  onProgress: (p: RangeProgress) => void,
+): Promise<Uint8Array> {
+  const ffmpeg = await ensureMounted(file, videoId)
+  const out = '/full-audio.m4a'
+
+  const progressListener = ({ progress }: { progress: number }) => {
+    onProgress({ ratio: Math.max(0, Math.min(1, progress)) })
+  }
+  ffmpeg.on('progress', progressListener)
+  onProgress({ ratio: null })
+
+  try {
+    const codecLower = codec.toLowerCase()
+    const canCopy =
+      codecLower === 'aac' || codecLower === 'mp3' || codecLower === 'mp4a'
+    const codecArgs = canCopy ? ['-c:a', 'copy'] : ['-c:a', 'aac', '-b:a', '128k']
+    const rc = await ffmpeg.exec([
+      '-i', `${MOUNT_DIR}/${mountedName}`,
+      '-vn',
+      '-map', `0:a:${trackIndex}`,
+      ...codecArgs,
+      '-movflags', '+faststart',
+      out,
+    ])
+    if (rc !== 0) throw new Error(`ffmpeg exit ${rc}`)
+    const data = await ffmpeg.readFile(out)
+    const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : data
+    const copy = new Uint8Array(bytes.byteLength)
+    copy.set(bytes)
+    try { await ffmpeg.deleteFile(out) } catch { /* ignore */ }
+    return copy
+  } finally {
+    ffmpeg.off('progress', progressListener)
+  }
+}
+
 function describeError(e: unknown): string {
   if (e && typeof e === 'object') {
     const obj = e as { message?: unknown; errno?: unknown; code?: unknown; name?: unknown }

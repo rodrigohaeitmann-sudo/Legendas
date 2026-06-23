@@ -174,11 +174,13 @@ export default function FileSetup({ onStart, onOpenSync, initialFiles, onInitial
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialFiles])
 
-  // Probe the chosen video's audio tracks whenever we'd actually use them
-  // (CC mode). Skipped in SRT mode — playback uses the browser's default
-  // audio track regardless, and probing would force ffmpeg to load early.
+  // Probe the chosen video's audio tracks the moment a video is picked.
+  // Used in two places: CC mode passes the chosen index to ffmpeg for
+  // transcription, and the player extracts that track separately when it
+  // isn't track 0 (the browser only ever plays one track and won't let us
+  // switch).
   useEffect(() => {
-    if (subSource !== 'audio' || !videoFile) {
+    if (!videoFile) {
       setAudioTracks(null)
       return
     }
@@ -212,7 +214,7 @@ export default function FileSetup({ onStart, onOpenSync, initialFiles, onInitial
     return () => {
       cancelled = true
     }
-  }, [videoFile, subSource, sourceLang])
+  }, [videoFile, sourceLang])
 
   function handleStart() {
     if (!videoFile) return
@@ -221,7 +223,7 @@ export default function FileSetup({ onStart, onOpenSync, initialFiles, onInitial
     const source: PipelineConfig['source'] =
       subSource === 'srt'
         ? { kind: 'srt', text: srtText }
-        : { kind: 'cc', whisperModel, audioTrackIndex }
+        : { kind: 'cc', whisperModel }
     if (subSource === 'srt' && !srtText) {
       setError('A legenda parece vazia. Tente outro arquivo.')
       return
@@ -232,6 +234,7 @@ export default function FileSetup({ onStart, onOpenSync, initialFiles, onInitial
       source,
       sourceLang,
       email: email.trim() || undefined,
+      audioTrackIndex,
     })
   }
 
@@ -306,59 +309,65 @@ export default function FileSetup({ onStart, onOpenSync, initialFiles, onInitial
           {srtFile && <small>{srtFile.name}</small>}
         </label>
       ) : (
-        <>
-          <label className="file-field">
-            <span>Qualidade da transcrição</span>
-            <select
-              value={whisperModel}
-              onChange={(e) => updateWhisperModel(e.target.value as WhisperModel)}
-            >
-              {WHISPER_MODELS.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.label}
-                </option>
-              ))}
-            </select>
-            <small>
-              A transcrição roda no seu aparelho (nada é enviado). O modelo é baixado uma
-              única vez. As legendas aparecem aos poucos no player conforme cada trecho
-              fica pronto.
-            </small>
-          </label>
+        <label className="file-field">
+          <span>Qualidade da transcrição</span>
+          <select
+            value={whisperModel}
+            onChange={(e) => updateWhisperModel(e.target.value as WhisperModel)}
+          >
+            {WHISPER_MODELS.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.label}
+              </option>
+            ))}
+          </select>
+          <small>
+            A transcrição roda no seu aparelho (nada é enviado). O modelo é baixado uma
+            única vez. As legendas aparecem aos poucos no player conforme cada trecho
+            fica pronto.
+          </small>
+        </label>
+      )}
 
-          {videoFile && (
-            <label className="file-field">
-              <span>Faixa de áudio</span>
-              {probingTracks && <small>Lendo faixas do vídeo…</small>}
-              {!probingTracks && audioTracks !== null && audioTracks.length === 0 && (
-                <small>Não consegui ler as faixas — usarei a primeira disponível.</small>
-              )}
-              {!probingTracks && audioTracks && audioTracks.length > 0 && (
-                <>
-                  <select
-                    value={audioTrackIndex}
-                    onChange={(e) => {
-                      trackTouchedRef.current = true
-                      setAudioTrackIndex(Number(e.target.value))
-                    }}
-                  >
-                    {audioTracks.map((t) => (
-                      <option key={t.index} value={t.index}>
-                        {trackLabel(t)}
-                      </option>
-                    ))}
-                  </select>
-                  {audioTracks.length > 1 && (
-                    <small>
-                      Vídeos dual áudio (ex.: francês + dublagem PT) tem várias faixas;
-                      escolha a do idioma que quer treinar.
-                    </small>
-                  )}
-                </>
-              )}
-            </label>
+      {/* Audio track selector applies to BOTH modes: in CC mode it picks the
+          track for transcription; in SRT mode (or always) it controls which
+          audio track gets extracted + played alongside the muted video. */}
+      {videoFile && (
+        <label className="file-field">
+          <span>Faixa de áudio</span>
+          {probingTracks && <small className="hint">Lendo faixas do vídeo…</small>}
+          {!probingTracks && audioTracks !== null && audioTracks.length === 0 && (
+            <small className="hint">
+              Não consegui ler as faixas — usarei a primeira disponível.
+            </small>
           )}
-        </>
+          {!probingTracks && audioTracks && audioTracks.length > 0 && (
+            <>
+              <select
+                value={audioTrackIndex}
+                onChange={(e) => {
+                  trackTouchedRef.current = true
+                  setAudioTrackIndex(Number(e.target.value))
+                }}
+              >
+                {audioTracks.map((t) => (
+                  <option key={t.index} value={t.index}>
+                    {trackLabel(t)}
+                  </option>
+                ))}
+              </select>
+              {audioTracks.length > 1 ? (
+                <small className="hint">
+                  Vídeos dual áudio (ex.: francês + dublagem PT) tem várias faixas;
+                  escolha o idioma que quer treinar. Se não for a faixa padrão, o áudio
+                  é extraído em segundo plano enquanto o vídeo já começa.
+                </small>
+              ) : (
+                <small className="hint">Só uma faixa de áudio neste vídeo.</small>
+              )}
+            </>
+          )}
+        </label>
       )}
 
       <label className="file-field">

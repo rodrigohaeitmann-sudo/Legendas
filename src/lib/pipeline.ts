@@ -27,7 +27,7 @@ const CHUNK_SECONDS = 180 // 3 min — short enough that the first cues
 
 export type SubtitleSource =
   | { kind: 'srt'; text: string }
-  | { kind: 'cc'; whisperModel: WhisperModel; audioTrackIndex: number }
+  | { kind: 'cc'; whisperModel: WhisperModel }
 
 export interface PipelineConfig {
   videoFile: File
@@ -35,6 +35,13 @@ export interface PipelineConfig {
   source: SubtitleSource
   sourceLang: SourceLang
   email?: string
+  /**
+   * Audio stream index inside the video file. CC mode feeds it to ffmpeg
+   * (`-map 0:a:<index>`); both modes also propagate it up to App so the
+   * player can sync a separately-extracted audio element when the chosen
+   * track isn't the one the browser plays by default.
+   */
+  audioTrackIndex: number
   /**
    * When resuming from a persisted session, the App already holds the
    * cues it had before reload. Setting this prevents onCuesReplaced /
@@ -305,7 +312,7 @@ export function startPipeline(
       if (config.source.kind === 'srt') {
         await runSrt(config.source.text)
       } else {
-        await runCc(config.source.whisperModel, config.source.audioTrackIndex)
+        await runCc(config.source.whisperModel, config.audioTrackIndex)
       }
     } catch (e) {
       if (!cancelled) {

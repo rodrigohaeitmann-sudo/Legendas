@@ -36,6 +36,22 @@ export interface StreamHandle {
   setPlaybackTime: (t: number) => void
 }
 
+export interface CachedChunkInput {
+  start: number
+  dur: number
+  bytes: Uint8Array
+}
+
+export interface CreateVideoStreamOptions {
+  /** fMP4 chunks previously extracted in another session — replayed verbatim
+   *  so we don't re-run ffmpeg over an already-processed range. Must be
+   *  sorted by `start` and form a contiguous range from 0. */
+  cachedChunks?: CachedChunkInput[]
+  /** Fired whenever a fresh chunk lands (not for cached ones) so the
+   *  caller can persist it to IDB for next-session resume. */
+  onChunkExtracted?: (start: number, dur: number, bytes: Uint8Array) => void
+}
+
 // Walks the top-level boxes of a fragmented MP4 and returns everything from
 // the first moof onwards. Used to strip ftyp + moov from chunks 2..N so the
 // SourceBuffer keeps the init segment from chunk 1 and only appends new
@@ -131,12 +147,17 @@ export async function createVideoStream(
   audioTrackIndex: number,
   duration: number,
   onProgress: (p: StreamProgress) => void,
+  opts: CreateVideoStreamOptions = {},
 ): Promise<StreamHandle> {
-  // Step 1: extract a tiny probe chunk so we can read the actual codec
-  // string from the avcC/hvcC box. Without the exact MSE codec string,
-  // addSourceBuffer rejects everything.
-  const probe = await extractMediaFmp4(file, videoId, audioTrackIndex, 0, 2)
-  const codec = findAvcCodecString(probe) ?? findHevcCodecString(probe)
+  // Step 1: get a chunk starting at 0 from which to read the codec string.
+  // If a cached chunk exists for that range we reuse its bytes; otherwise
+  // we ffmpeg-extract a tiny probe chunk. This means resumed sessions
+  // never pay the probe cost again.
+  const cached = (opts.cachedChunks ?? []).filter((c) => c.dur > 0).sort((a, b) => a.start - b.start)
+  const cachedHead = cached[0]?.start === 0 ? cached[0] : null
+  const probeBytes = cachedHead?.bytes ?? (await extractMediaFmp4(file, videoId, audioTrackIndex, 0, 2))
+  const probeDur = cachedHead?.dur ?? 2
+  const codec = findAvcCodecString(probeBytes) ?? findHevcCodecString(probeBytes)
   if (!codec) {
     throw new Error('codec de vídeo não detectado no fMP4 — provavelmente formato não suportado')
   }
@@ -153,46 +174,51 @@ export async function createVideoStream(
   let cancelled = false
   let firstReady = false
   let feedingActive = false
-  // The 2 s probe is reused as the first init+media payload — no need to
-  // re-run ffmpeg for chunk 0.
-  let firstChunk: Uint8Array | null = probe
+  // Queue of bytes already produced and waiting to be appended:
+  // - The probe (or cached chunk 0) goes first.
+  // - Any cached chunks with start > 0 follow, in order.
+  // After this queue drains, the loop starts extracting from extractedTo.
+  type Pending = { bytes: Uint8Array; start: number; dur: number; fromCache: boolean }
+  const pending: Pending[] = []
+  pending.push({ bytes: probeBytes, start: 0, dur: probeDur, fromCache: !!cachedHead })
+  for (const c of cached) {
+    if (c.start === 0) continue
+    pending.push({ bytes: c.bytes, start: c.start, dur: c.dur, fromCache: true })
+  }
 
   async function feedChunk() {
     if (feedingActive) return
     feedingActive = true
     try {
       while (!cancelled && sourceBuffer) {
-        if (extractedTo >= duration) {
+        if (extractedTo >= duration && pending.length === 0) {
           if (ms.readyState === 'open') {
             try { ms.endOfStream() } catch { /* may already be ended */ }
           }
           return
         }
-        if (extractedTo - playbackTime > BUFFER_AHEAD_S) {
+        if (
+          pending.length === 0 &&
+          extractedTo - playbackTime > BUFFER_AHEAD_S
+        ) {
           // Plenty of buffer ahead — wait for the next setPlaybackTime poke.
           return
         }
 
-        let bytes: Uint8Array
-        let start: number
-        let dur: number
-        if (firstChunk) {
-          bytes = firstChunk
-          firstChunk = null
-          start = 0
-          // The probe ran with `-t 2` so we know its duration even without
-          // demuxing the output. Pad with a fresh first chunk for the rest.
-          dur = 2
+        let next: Pending
+        if (pending.length > 0) {
+          next = pending.shift()!
         } else {
-          start = extractedTo
+          const start = extractedTo
           const chunkSec = start === 0 ? FIRST_CHUNK_S : NEXT_CHUNK_S
-          dur = Math.min(chunkSec, duration - start)
+          const dur = Math.min(chunkSec, duration - start)
           if (dur <= 0) {
             if (ms.readyState === 'open') {
               try { ms.endOfStream() } catch { /* ignore */ }
             }
             return
           }
+          let bytes: Uint8Array
           try {
             bytes = await extractMediaFmp4(file, videoId, audioTrackIndex, start, dur)
           } catch (e) {
@@ -200,9 +226,10 @@ export async function createVideoStream(
             return
           }
           if (cancelled || !sourceBuffer) return
+          next = { bytes, start, dur, fromCache: false }
         }
 
-        const dataToFeed = start === 0 ? bytes : stripInitSegment(bytes)
+        const dataToFeed = next.start === 0 ? next.bytes : stripInitSegment(next.bytes)
         await waitForUpdate(sourceBuffer)
         if (cancelled || !sourceBuffer) return
         try {
@@ -214,8 +241,11 @@ export async function createVideoStream(
         await waitForUpdate(sourceBuffer)
         if (cancelled) return
 
-        extractedTo = start + dur
+        // extractedTo always advances to the end of the latest chunk we
+        // appended, whether it came from cache or fresh extraction.
+        extractedTo = Math.max(extractedTo, next.start + next.dur)
         if (!firstReady) firstReady = true
+        if (!next.fromCache) opts.onChunkExtracted?.(next.start, next.dur, next.bytes)
         onProgress({ firstReady, bufferedTo: extractedTo, duration })
       }
     } finally {

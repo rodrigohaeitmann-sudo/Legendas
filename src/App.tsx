@@ -17,6 +17,12 @@ import {
 import { clearCcProgress } from './lib/ccCache'
 import { probeAudioTracks, probeDuration } from './lib/audioExtract'
 import { createVideoStream, type StreamHandle } from './lib/videoStreamMse'
+import {
+  clearAllChunks,
+  loadChunksFor,
+  pruneOtherVideos,
+  saveChunk,
+} from './lib/mediaChunkCache'
 import FileSetup from './components/FileSetup'
 import VideoStage from './components/VideoStage'
 import SubtitleToggles from './components/SubtitleToggles'
@@ -94,7 +100,7 @@ export default function App() {
   // Holds the videoBlob + pipeline source so the periodic save can
   // re-emit the full session record without forcing FileSetup to keep
   // passing the File around.
-  const buildRef = useRef<{ videoBlob: Blob; resume: SessionResume } | null>(null)
+  const buildRef = useRef<{ videoBlob: Blob; audioTrackIndex: number; resume: SessionResume } | null>(null)
 
   useEffect(() => { mediaRef.current = media }, [media])
   useEffect(() => { phaseRef.current = phase }, [phase])
@@ -148,70 +154,93 @@ export default function App() {
     setAudioStatus({ kind: 'idle' })
   }, [])
 
-  const runAudioTrackExtraction = useCallback((config: PipelineConfig) => {
-    releaseAudio()
-    // Track 0 is what the browser plays by default — no streaming needed.
-    if (config.audioTrackIndex === 0) return
-    const token = ++audioTokenRef.current
+  const runAudioTrackExtraction = useCallback(
+    (config: PipelineConfig | { videoFile: File; videoId: string; audioTrackIndex: number }) => {
+      releaseAudio()
+      // Track 0 is what the browser plays by default — no streaming needed.
+      if (config.audioTrackIndex === 0) return
+      const token = ++audioTokenRef.current
+      const { videoFile, videoId, audioTrackIndex } = config
 
-    void (async () => {
-      try {
-        setAudioStatus({ kind: 'extracting', pct: null })
-        // Need duration up front so MSE knows the overall timeline and
-        // seeks work even before the entire stream is buffered.
-        const duration = await probeDuration(config.videoFile, config.videoId)
-        if (token !== audioTokenRef.current) return
-        const tracks = await probeAudioTracks(config.videoFile, config.videoId)
-        if (token !== audioTokenRef.current) return
-        const track = tracks[config.audioTrackIndex]
-        if (!track) {
-          setAudioStatus({ kind: 'error', message: 'Faixa de áudio não encontrada.' })
-          return
-        }
+      void (async () => {
+        try {
+          setAudioStatus({ kind: 'extracting', pct: null })
+          // Pull any chunks this video+track produced in a previous session
+          // so we don't re-run ffmpeg over the same range.
+          const cached = await loadChunksFor(videoId, audioTrackIndex)
+          if (token !== audioTokenRef.current) return
+          // Need duration up front so MSE knows the overall timeline and
+          // seeks work even before the entire stream is buffered.
+          const duration = await probeDuration(videoFile, videoId)
+          if (token !== audioTokenRef.current) return
+          const tracks = await probeAudioTracks(videoFile, videoId)
+          if (token !== audioTokenRef.current) return
+          const track = tracks[audioTrackIndex]
+          if (!track) {
+            setAudioStatus({ kind: 'error', message: 'Faixa de áudio não encontrada.' })
+            return
+          }
+          // Evict cache for other videos/tracks the moment we're committing
+          // to this one — keeps IDB from growing unbounded.
+          void pruneOtherVideos(videoId, audioTrackIndex).catch(() => undefined)
 
-        const stream = await createVideoStream(
-          config.videoFile,
-          config.videoId,
-          config.audioTrackIndex,
-          duration,
-          (p) => {
-            if (token !== audioTokenRef.current) return
-            const pct = duration > 0 ? Math.min(100, (p.bufferedTo / duration) * 100) : null
-            if (p.bufferedTo >= duration) {
-              setAudioStatus({ kind: 'idle' })
-            } else {
-              setAudioStatus({ kind: 'extracting', pct })
-            }
-          },
-        )
-        if (token !== audioTokenRef.current) {
-          stream.cancel()
-          return
+          const stream = await createVideoStream(
+            videoFile,
+            videoId,
+            audioTrackIndex,
+            duration,
+            (p) => {
+              if (token !== audioTokenRef.current) return
+              const pct = duration > 0 ? Math.min(100, (p.bufferedTo / duration) * 100) : null
+              if (p.bufferedTo >= duration) {
+                setAudioStatus({ kind: 'idle' })
+              } else {
+                setAudioStatus({ kind: 'extracting', pct })
+              }
+            },
+            {
+              cachedChunks: cached.map((c) => ({
+                start: c.start,
+                dur: c.dur,
+                bytes: c.bytes,
+              })),
+              onChunkExtracted: (start, dur, bytes) => {
+                // Persist so a reload can skip this range next time. The
+                // bytes typed-array survives postMessage to IDB.
+                void saveChunk(videoId, audioTrackIndex, start, dur, bytes).catch(() => undefined)
+              },
+            },
+          )
+          if (token !== audioTokenRef.current) {
+            stream.cancel()
+            return
+          }
+          audioStreamRef.current = stream
+          // Swap the <video> element over to the MSE source so video + chosen
+          // audio stream from a single buffer (no two-element sync drift).
+          // Restore the playhead afterwards because changing src reloads.
+          setMedia((m) => {
+            if (!m || m.videoId !== videoId) return m
+            const previous = m.videoUrl
+            // Hold off revoking the native URL until the video has loaded
+            // the new MSE URL — revoking too eagerly can blank the element.
+            window.setTimeout(() => {
+              if (previous !== stream.url) URL.revokeObjectURL(previous)
+            }, 1500)
+            return { ...m, videoUrl: stream.url }
+          })
+        } catch (e) {
+          if (token !== audioTokenRef.current) return
+          console.error('audio stream setup failed', e)
+          setAudioStatus({
+            kind: 'error',
+            message: `Falha ao preparar áudio: ${e instanceof Error ? e.message : String(e)}`,
+          })
         }
-        audioStreamRef.current = stream
-        // Swap the <video> element over to the MSE source so video + chosen
-        // audio stream from a single buffer (no two-element sync drift).
-        // Restore the playhead afterwards because changing src reloads.
-        setMedia((m) => {
-          if (!m || m.videoId !== config.videoId) return m
-          // Hold off revoking the native URL until the video has loaded the
-          // new MSE URL — revoking too eagerly can blank the element.
-          const previous = m.videoUrl
-          window.setTimeout(() => {
-            if (previous !== stream.url) URL.revokeObjectURL(previous)
-          }, 1500)
-          return { ...m, videoUrl: stream.url }
-        })
-      } catch (e) {
-        if (token !== audioTokenRef.current) return
-        console.error('audio stream setup failed', e)
-        setAudioStatus({
-          kind: 'error',
-          message: `Falha ao preparar áudio: ${e instanceof Error ? e.message : String(e)}`,
-        })
-      }
-    })()
-  }, [releaseAudio])
+      })()
+    },
+    [releaseAudio],
+  )
 
   const startBuildInternal = useCallback(
     (config: PipelineConfig, initialMedia?: LoadedMedia) => {
@@ -229,10 +258,10 @@ export default function App() {
 
       buildRef.current = {
         videoBlob: config.videoFile,
+        audioTrackIndex: config.audioTrackIndex,
         resume: {
           sourceLang: config.sourceLang,
           email: config.email,
-          audioTrackIndex: config.audioTrackIndex,
           source: config.source,
         },
       }
@@ -243,11 +272,12 @@ export default function App() {
       runAudioTrackExtraction(config)
 
       // Write an immediate baseline so even a fast reload right after
-      // Start still finds the file + resume info in IDB.
+      // Start still finds the file + audio-track + resume info in IDB.
       void saveSession({
         videoId: opening.videoId,
         videoBlob: config.videoFile,
         cues: opening.cues,
+        audioTrackIndex: config.audioTrackIndex,
         resume: buildRef.current.resume,
       }).catch(() => undefined)
 
@@ -289,31 +319,44 @@ export default function App() {
           videoId: session.videoId,
           cues: session.cues,
         }
+        // Reconstruct the File from the persisted Blob — needed both for
+        // pipeline resume and for the audio-track re-mux.
+        const videoFile = session.videoBlob instanceof File
+          ? session.videoBlob
+          : new File([session.videoBlob], 'video.mkv')
+        const audioTrackIndex = session.audioTrackIndex ?? 0
+
         if (session.resume) {
-          // The File object is preserved as a Blob in IDB; cast it back to
-          // File so the rest of the pipeline (ffmpeg WORKERFS, name-based
-          // paths) keeps working.
-          const videoFile = session.videoBlob instanceof File
-            ? session.videoBlob
-            : new File([session.videoBlob], 'video.mkv')
           const config: PipelineConfig = {
             videoFile,
             videoId: session.videoId,
             source: session.resume.source,
             sourceLang: session.resume.sourceLang,
             email: session.resume.email,
-            audioTrackIndex: session.resume.audioTrackIndex ?? 0,
+            audioTrackIndex,
             initialCueCount: session.cues.length,
           }
           startBuildInternal(config, initialMedia)
         } else {
+          // Build finished in a previous session; just reopen the player
+          // with the saved cues. Audio re-mux (if any) resumes below.
           setMedia(initialMedia)
           mediaRef.current = initialMedia
+          if (audioTrackIndex !== 0) {
+            // No buildRef in this path (build is already done) — we still
+            // need to kick the MSE re-mux so the saved track plays. The
+            // cached chunks IDB makes this resume rather than re-extract.
+            runAudioTrackExtraction({
+              videoFile,
+              videoId: session.videoId,
+              audioTrackIndex,
+            })
+          }
         }
       })
       .catch(() => undefined)
       .finally(() => setRestoring(false))
-  }, [startBuildInternal])
+  }, [startBuildInternal, runAudioTrackExtraction])
 
   useEffect(() => {
     setOffset(loadOffset(media?.videoId))
@@ -373,6 +416,7 @@ export default function App() {
         videoId: m.videoId,
         videoBlob: build.videoBlob,
         cues: m.cues,
+        audioTrackIndex: build.audioTrackIndex,
         resume: build.resume,
       }
       return saveSession(record).catch(() => undefined)
@@ -397,10 +441,14 @@ export default function App() {
     const build = buildRef.current
     const current = media
     if (!build || !current) return
+    // Keep audioTrackIndex in the final record so reopens after the build
+    // completes still know which track to re-mux via MSE. Drop `resume`
+    // — that's only for "pipeline still in progress".
     void saveSession({
       videoId: current.videoId,
       videoBlob: build.videoBlob,
       cues: current.cues,
+      audioTrackIndex: build.audioTrackIndex,
     }).catch(() => undefined)
     buildRef.current = null
   }, [phase, media])
@@ -430,6 +478,9 @@ export default function App() {
     buildRef.current = null
     void clearSession().catch(() => undefined)
     void clearCcProgress().catch(() => undefined)
+    // Back is "I'm done with this video"; drop the cached audio chunks too
+    // so they don't take IDB space until the user picks the same file again.
+    void clearAllChunks().catch(() => undefined)
   }
 
   if (restoring) {

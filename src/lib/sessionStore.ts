@@ -11,7 +11,6 @@ const KEY = 'last'
 export interface SessionResume {
   sourceLang: SourceLang
   email?: string
-  audioTrackIndex: number
   source:
     | { kind: 'srt'; text: string }
     | { kind: 'cc'; whisperModel: WhisperModel }
@@ -21,6 +20,10 @@ export interface StoredSession {
   videoId: string
   videoBlob: Blob
   cues: MergedCue[]
+  /** Chosen audio track. Stays in the session even after the pipeline
+      completes so reopens know to resume the MSE re-mux for the right
+      track instead of falling back to the file's default audio. */
+  audioTrackIndex?: number
   /** Present only while the build is still in progress; cleared on done. */
   resume?: SessionResume
 }

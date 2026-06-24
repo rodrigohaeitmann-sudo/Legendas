@@ -16,7 +16,7 @@ import {
 } from './lib/pipeline'
 import { clearCcProgress } from './lib/ccCache'
 import { probeAudioTracks, probeDuration } from './lib/audioExtract'
-import { createAudioStream, type StreamHandle } from './lib/audioStreamMse'
+import { createVideoStream, type StreamHandle } from './lib/videoStreamMse'
 import FileSetup from './components/FileSetup'
 import VideoStage from './components/VideoStage'
 import SubtitleToggles from './components/SubtitleToggles'
@@ -81,10 +81,9 @@ export default function App() {
   // Files handed to us by the OS when the PWA is launched via "Open with"
   // from a file manager — funnelled into FileSetup as pre-filled inputs.
   const [incomingFiles, setIncomingFiles] = useState<File[]>([])
-  // Replacement audio track URL + extraction progress, for dual-audio MKVs
-  // where the user chose a non-default track. null = play the video's own
-  // audio (browser default).
-  const [audioSrc, setAudioSrc] = useState<string | null>(null)
+  // Status of the MSE stream that swaps the chosen audio track in for
+  // dual-audio MKVs. media.videoUrl is what actually changes when the
+  // stream is ready; this just drives the progress banner.
   const [audioStatus, setAudioStatus] = useState<AudioStatus>({ kind: 'idle' })
 
   const pipelineRef = useRef<PipelineHandle | null>(null)
@@ -131,19 +130,21 @@ export default function App() {
     })
   }, [])
 
-  // Streams the chosen audio track to the <audio> element via MSE — small
-  // first chunk for fast start, subsequent chunks fed ahead of the playhead.
-  // Token guards against a stream landing after the user has gone Back or
-  // picked a different video.
+  // Streams the combined video + chosen audio track via MSE so the browser
+  // handles A/V sync internally — fixes the drift the dual-element
+  // <video>/<audio> approach had. We swap media.videoUrl from the native
+  // file blob to the MediaSource URL once the codec probe lands.
   const audioTokenRef = useRef(0)
   const audioStreamRef = useRef<StreamHandle | null>(null)
+  // Last known video.currentTime — restored after we swap the video src
+  // from the native file URL to the MSE URL, since src changes reload.
+  const currentTimeRef = useRef(0)
 
   const releaseAudio = useCallback(() => {
     if (audioStreamRef.current) {
       audioStreamRef.current.cancel()
       audioStreamRef.current = null
     }
-    setAudioSrc(null)
     setAudioStatus({ kind: 'idle' })
   }, [])
 
@@ -160,8 +161,6 @@ export default function App() {
         // seeks work even before the entire stream is buffered.
         const duration = await probeDuration(config.videoFile, config.videoId)
         if (token !== audioTokenRef.current) return
-        // Probe just to validate the track index is real; the streamer
-        // transcodes universally to AAC-LC so we don't need the codec name.
         const tracks = await probeAudioTracks(config.videoFile, config.videoId)
         if (token !== audioTokenRef.current) return
         const track = tracks[config.audioTrackIndex]
@@ -170,23 +169,18 @@ export default function App() {
           return
         }
 
-        const stream = createAudioStream(
+        const stream = await createVideoStream(
           config.videoFile,
           config.videoId,
           config.audioTrackIndex,
           duration,
           (p) => {
             if (token !== audioTokenRef.current) return
-            // Surface coarse % so the banner advances while we buffer ahead.
             const pct = duration > 0 ? Math.min(100, (p.bufferedTo / duration) * 100) : null
-            if (!p.firstReady) {
-              setAudioStatus({ kind: 'extracting', pct })
-            } else if (p.bufferedTo < duration) {
-              // First chunk landed — playback can start; keep the banner up
-              // (but it'll auto-hide once we're fully buffered).
-              setAudioStatus({ kind: 'extracting', pct })
-            } else {
+            if (p.bufferedTo >= duration) {
               setAudioStatus({ kind: 'idle' })
+            } else {
+              setAudioStatus({ kind: 'extracting', pct })
             }
           },
         )
@@ -195,7 +189,19 @@ export default function App() {
           return
         }
         audioStreamRef.current = stream
-        setAudioSrc(stream.url)
+        // Swap the <video> element over to the MSE source so video + chosen
+        // audio stream from a single buffer (no two-element sync drift).
+        // Restore the playhead afterwards because changing src reloads.
+        setMedia((m) => {
+          if (!m || m.videoId !== config.videoId) return m
+          // Hold off revoking the native URL until the video has loaded the
+          // new MSE URL — revoking too eagerly can blank the element.
+          const previous = m.videoUrl
+          window.setTimeout(() => {
+            if (previous !== stream.url) URL.revokeObjectURL(previous)
+          }, 1500)
+          return { ...m, videoUrl: stream.url }
+        })
       } catch (e) {
         if (token !== audioTokenRef.current) return
         console.error('audio stream setup failed', e)
@@ -327,10 +333,29 @@ export default function App() {
   }, [settings.speed, media?.videoId, videoRef])
 
   // Keep the MSE feeder informed about the playhead so it pulls ahead at
-  // the right pace and resumes after a seek.
+  // the right pace and resumes after a seek. Also mirror currentTime to
+  // a ref so the audio-track swap can capture it before the <video> src
+  // reload wipes it.
   useEffect(() => {
+    currentTimeRef.current = currentTime
     audioStreamRef.current?.setPlaybackTime(currentTime)
   }, [currentTime])
+
+  // When media.videoUrl changes mid-playback (audio-track swap to MSE),
+  // the <video> reloads at 0. Seek back to where the user was.
+  useEffect(() => {
+    const v = videoRef.current
+    if (!v) return
+    const target = currentTimeRef.current
+    if (target <= 0) return
+    const seek = () => {
+      try { v.currentTime = target } catch { /* ignore */ }
+    }
+    if (v.readyState >= 1) seek()
+    else v.addEventListener('loadedmetadata', seek, { once: true })
+    return () => v.removeEventListener('loadedmetadata', seek)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [media?.videoUrl])
 
   // Save in-progress state regularly while the pipeline is running, and
   // again right before the tab goes hidden — covers backgrounding, swipe
@@ -436,7 +461,6 @@ export default function App() {
       <VideoStage
         videoRef={videoRef}
         src={media.videoUrl}
-        audioSrc={audioSrc}
         currentTime={currentTime}
         duration={duration}
         isPlaying={isPlaying}

@@ -275,6 +275,57 @@ export async function extractAudioRange(
   }
 }
 
+// Extracts a combined video+audio fragmented MP4 chunk with the chosen
+// audio track. Used to swap audio tracks on dual-audio MKVs without the
+// drift two-element sync produces: by feeding video+audio to a single MSE
+// SourceBuffer, the browser's media engine handles A/V sync internally.
+//
+// Video is copied (no re-encode) — fast and pixel-perfect, requires the
+// source codec to be browser-playable inside MP4 (H.264 / HEVC / AV1).
+// Audio is always transcoded to AAC-LC so the MSE codec string is
+// predictable and AC3/DTS sources work.
+export async function extractMediaFmp4(
+  file: File,
+  videoId: string,
+  audioTrackIndex: number,
+  startSec: number,
+  durationSec: number,
+): Promise<Uint8Array> {
+  const ffmpeg = await ensureMounted(file, videoId)
+  const out = '/media-chunk.mp4'
+  try {
+    const rc = await ffmpeg.exec([
+      '-ss', String(startSec),
+      // -copyts keeps the input timestamps so subsequent chunks line up
+      // on a single MSE timeline; without it ffmpeg would reset PTS to 0
+      // on every -ss call and chunks would overwrite each other.
+      '-copyts',
+      '-i', `${MOUNT_DIR}/${mountedName}`,
+      '-t', String(durationSec),
+      '-map', '0:v:0',
+      '-map', `0:a:${audioTrackIndex}`,
+      '-c:v', 'copy',
+      '-c:a', 'aac',
+      '-b:a', '128k',
+      '-profile:a', 'aac_low',
+      '-muxdelay', '0',
+      '-muxpreload', '0',
+      '-f', 'mp4',
+      '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+      out,
+    ])
+    if (rc !== 0) throw new Error(`ffmpeg exit ${rc}`)
+    const data = await ffmpeg.readFile(out)
+    const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : data
+    const copy = new Uint8Array(bytes.byteLength)
+    copy.set(bytes)
+    try { await ffmpeg.deleteFile(out) } catch { /* ignore */ }
+    return copy
+  } catch (e) {
+    throw new Error(`extract falhou: ${describeError(e)}`)
+  }
+}
+
 // Extracts a fragmented MP4 (fMP4) audio chunk suitable for feeding to a
 // MediaSource via MSE. Each chunk contains its own ftyp + moov so the first
 // one can be sent as the init segment; we strip the ftyp + moov from the

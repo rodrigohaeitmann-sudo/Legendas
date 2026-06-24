@@ -161,6 +161,7 @@ export default function App() {
       if (config.audioTrackIndex === 0) return
       const token = ++audioTokenRef.current
       const { videoFile, videoId, audioTrackIndex } = config
+      console.debug('[audio] starting track extraction', { videoId, audioTrackIndex })
 
       void (async () => {
         try {
@@ -168,6 +169,8 @@ export default function App() {
           // Pull any chunks this video+track produced in a previous session
           // so we don't re-run ffmpeg over the same range.
           const cached = await loadChunksFor(videoId, audioTrackIndex)
+          console.debug('[audio] cached chunks:', cached.length, 'covering up to',
+            cached.length ? cached[cached.length - 1].start + cached[cached.length - 1].dur : 0, 's')
           if (token !== audioTokenRef.current) return
           // Need duration up front so MSE knows the overall timeline and
           // seeks work even before the entire stream is buffered.
@@ -324,7 +327,22 @@ export default function App() {
         const videoFile = session.videoBlob instanceof File
           ? session.videoBlob
           : new File([session.videoBlob], 'video.mkv')
-        const audioTrackIndex = session.audioTrackIndex ?? 0
+        // Migration: older sessions stored audioTrackIndex inside `resume`.
+        // Read that as a fallback so users who picked a track before this
+        // field hoisted don't lose it on reopen.
+        const legacyResume = session.resume as { audioTrackIndex?: number } | undefined
+        const audioTrackIndex =
+          session.audioTrackIndex ?? legacyResume?.audioTrackIndex ?? 0
+        console.debug(
+          '[restore] session loaded; videoId=',
+          session.videoId,
+          'audioTrackIndex=',
+          audioTrackIndex,
+          'cues=',
+          session.cues.length,
+          'resume?=',
+          !!session.resume,
+        )
 
         if (session.resume) {
           const config: PipelineConfig = {
@@ -343,6 +361,7 @@ export default function App() {
           setMedia(initialMedia)
           mediaRef.current = initialMedia
           if (audioTrackIndex !== 0) {
+            console.debug('[restore] kicking audio re-mux for track', audioTrackIndex)
             // No buildRef in this path (build is already done) — we still
             // need to kick the MSE re-mux so the saved track plays. The
             // cached chunks IDB makes this resume rather than re-extract.
@@ -351,6 +370,16 @@ export default function App() {
               videoId: session.videoId,
               audioTrackIndex,
             })
+            // Persist the migrated value at the top level so the next reload
+            // skips the legacy-resume fallback entirely.
+            if (session.audioTrackIndex === undefined) {
+              void saveSession({
+                videoId: session.videoId,
+                videoBlob: session.videoBlob,
+                cues: session.cues,
+                audioTrackIndex,
+              }).catch(() => undefined)
+            }
           }
         }
       })

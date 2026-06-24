@@ -50,6 +50,9 @@ export interface CreateVideoStreamOptions {
   /** Fired whenever a fresh chunk lands (not for cached ones) so the
    *  caller can persist it to IDB for next-session resume. */
   onChunkExtracted?: (start: number, dur: number, bytes: Uint8Array) => void
+  /** Fired if the codec probe / SourceBuffer setup fails outright so the
+   *  caller can surface the error to the user. */
+  onError?: (e: Error) => void
 }
 
 // Walks the top-level boxes of a fragmented MP4 and returns everything from
@@ -141,31 +144,21 @@ function waitForUpdate(sb: SourceBuffer): Promise<void> {
   })
 }
 
-export async function createVideoStream(
+// Returns synchronously with the MediaSource URL so the caller can hand it
+// straight to <video src=...>. All the heavy work (codec probe, addSourceBuffer,
+// chunk feeding) happens inside the `sourceopen` handler — meaning the video
+// element and MS connect first, and only THEN do we add the SourceBuffer.
+// This avoids the previous "open with native blob URL, swap to MSE later"
+// dance, which left Chrome on Android with an inconsistent video element
+// (black screen, no decode) when the swap landed mid-load.
+export function createVideoStream(
   file: File,
   videoId: string,
   audioTrackIndex: number,
   duration: number,
   onProgress: (p: StreamProgress) => void,
   opts: CreateVideoStreamOptions = {},
-): Promise<StreamHandle> {
-  // Step 1: get a chunk starting at 0 from which to read the codec string.
-  // If a cached chunk exists for that range we reuse its bytes; otherwise
-  // we ffmpeg-extract a tiny probe chunk. This means resumed sessions
-  // never pay the probe cost again.
-  const cached = (opts.cachedChunks ?? []).filter((c) => c.dur > 0).sort((a, b) => a.start - b.start)
-  const cachedHead = cached[0]?.start === 0 ? cached[0] : null
-  const probeBytes = cachedHead?.bytes ?? (await extractMediaFmp4(file, videoId, audioTrackIndex, 0, 2))
-  const probeDur = cachedHead?.dur ?? 2
-  const codec = findAvcCodecString(probeBytes) ?? findHevcCodecString(probeBytes)
-  if (!codec) {
-    throw new Error('codec de vídeo não detectado no fMP4 — provavelmente formato não suportado')
-  }
-  const mimeType = `video/mp4; codecs="${codec}, mp4a.40.2"`
-  if (typeof MediaSource === 'undefined' || !MediaSource.isTypeSupported(mimeType)) {
-    throw new Error(`navegador não toca ${mimeType}`)
-  }
-
+): StreamHandle {
   const ms = new MediaSource()
   const url = URL.createObjectURL(ms)
   let sourceBuffer: SourceBuffer | null = null
@@ -174,17 +167,9 @@ export async function createVideoStream(
   let cancelled = false
   let firstReady = false
   let feedingActive = false
-  // Queue of bytes already produced and waiting to be appended:
-  // - The probe (or cached chunk 0) goes first.
-  // - Any cached chunks with start > 0 follow, in order.
-  // After this queue drains, the loop starts extracting from extractedTo.
   type Pending = { bytes: Uint8Array; start: number; dur: number; fromCache: boolean }
+  // Filled inside sourceopen after the codec probe lands.
   const pending: Pending[] = []
-  pending.push({ bytes: probeBytes, start: 0, dur: probeDur, fromCache: !!cachedHead })
-  for (const c of cached) {
-    if (c.start === 0) continue
-    pending.push({ bytes: c.bytes, start: c.start, dur: c.dur, fromCache: true })
-  }
 
   async function feedChunk() {
     if (feedingActive) return
@@ -253,17 +238,51 @@ export async function createVideoStream(
     }
   }
 
+  // sourceopen fires once the <video> element has the MediaSource URL
+  // assigned. We do the codec probe here (rather than synchronously up
+  // front) so the caller gets the MSE URL immediately and there's no
+  // need for a mid-load src swap on the <video> element.
   ms.addEventListener('sourceopen', () => {
     if (cancelled) return
-    try {
-      sourceBuffer = ms.addSourceBuffer(mimeType)
-      sourceBuffer.mode = 'segments'
-      try { ms.duration = duration } catch { /* may not be settable yet */ }
-    } catch (e) {
-      console.error('MSE addSourceBuffer failed', e)
-      return
-    }
-    void feedChunk()
+    void (async () => {
+      try {
+        // Pull cached chunks in order; reuse the start=0 chunk for codec
+        // probing so resumed sessions don't pay the probe cost again.
+        const cached = (opts.cachedChunks ?? [])
+          .filter((c) => c.dur > 0)
+          .sort((a, b) => a.start - b.start)
+        const cachedHead = cached[0]?.start === 0 ? cached[0] : null
+        const probeBytes =
+          cachedHead?.bytes ??
+          (await extractMediaFmp4(file, videoId, audioTrackIndex, 0, 2))
+        if (cancelled) return
+        const probeDur = cachedHead?.dur ?? 2
+
+        const codec = findAvcCodecString(probeBytes) ?? findHevcCodecString(probeBytes)
+        if (!codec) {
+          throw new Error('codec de vídeo não detectado no fMP4')
+        }
+        const mimeType = `video/mp4; codecs="${codec}, mp4a.40.2"`
+        if (typeof MediaSource === 'undefined' || !MediaSource.isTypeSupported(mimeType)) {
+          throw new Error(`navegador não toca ${mimeType}`)
+        }
+
+        if (cancelled || ms.readyState !== 'open') return
+        sourceBuffer = ms.addSourceBuffer(mimeType)
+        sourceBuffer.mode = 'segments'
+        try { ms.duration = duration } catch { /* may not be settable yet */ }
+
+        pending.push({ bytes: probeBytes, start: 0, dur: probeDur, fromCache: !!cachedHead })
+        for (const c of cached) {
+          if (c.start === 0) continue
+          pending.push({ bytes: c.bytes, start: c.start, dur: c.dur, fromCache: true })
+        }
+        void feedChunk()
+      } catch (e) {
+        console.error('MSE setup failed', e)
+        opts.onError?.(e instanceof Error ? e : new Error(String(e)))
+      }
+    })()
   }, { once: true })
 
   return {
